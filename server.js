@@ -195,3 +195,11 @@ app.post('/webhook', lineMiddleware(config), async (req, res) => {
     }
   }
 });
+
+
+// （任意）トップを叩いた時の表示
+app.get('/', (_, res) => res.send('Shiraishi China Preview Bot running. /health = OK'));
+
+// ★ Renderは指定ポートでlisten必須
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Server started on ${PORT}`));
