@@ -1,5 +1,3 @@
-Server.is かんせーばん！
-
 // server.js — Shiraishi China LINE Bot (natural chat + scheduler + admin reset)
 // Node v18+ / ESM
 
