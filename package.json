@@ -1,16 +1,15 @@
 
 {
-  "name": "china-bot-preview2",
+  "name": "china-bot-natural",
   "version": "1.0.0",
   "type": "module",
-  "scripts": {
-    "start": "node server.js"
-  },
+  "scripts": { "start": "node server.js" },
   "dependencies": {
     "@line/bot-sdk": "^7.5.2",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "node-cache": "^5.1.2",
-    "node-cron": "^3.0.3"
+    "node-cron": "^3.0.3",
+    "openai": "^4.58.1"
   }
 }
