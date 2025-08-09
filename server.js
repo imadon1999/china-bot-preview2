@@ -167,14 +167,31 @@ app.post('/webhook', lineMiddleware(config), async (req, res) => {
       const u = await ensureUser(e);
 
       if (e.message.type === 'text') {
-        if (!u.consent) { await client.replyMessage(e.replyToken, consentMessage()); continue; }
-        const replies = await routeText(u, e.message.text || '');
+        const text = e.message.text || '';
+
+        // ★ 同意フローはガードより先に処理する
+        if (!u.consent && /^(同意|やめておく)$/i.test(text)) {
+          const replies = await routeText(u, text);
+          if (replies?.length) await client.replyMessage(e.replyToken, replies);
+          continue;
+        }
+
+        // ★ 未同意のときはカードだけ返す（ここで初めてガード）
+        if (!u.consent) {
+          await client.replyMessage(e.replyToken, consentMessage());
+          continue;
+        }
+
+        // 通常ルーティング
+        const replies = await routeText(u, text);
         if (replies?.length) await client.replyMessage(e.replyToken, replies);
         continue;
       }
+
+      // 画像/スタンプ等
       await client.replyMessage(e.replyToken, { type: 'text', text: u.loverMode ? '写真ありがと…大事に見るね📷💗' : '送ってくれてありがとう！' });
-    } catch (err) { console.error('handle error', err?.response?.data || err); }
+    } catch (err) {
+      console.error('handle error', err?.response?.data || err);
+    }
   }
 });
-app.get('/', (_, res) => res.send('Shiraishi China Preview Bot running. /health = OK'));
-app.listen(process.env.PORT || 3000, () => console.log('Server started.'));
