@@ -1,65 +1,50 @@
+// server.js  ── LINE Bot「白石ちな」最新版（自然会話・同意フロー・定時配信・ログ強化）
 
-// server.js
 import 'dotenv/config';
 import express from 'express';
 import { Client, middleware as lineMiddleware } from '@line/bot-sdk';
 import NodeCache from 'node-cache';
 
-// =========================
-// 基本設定（環境変数）
-// =========================
+// ---------- 基本設定 ----------
 const config = {
   channelAccessToken: process.env.CHANNEL_ACCESS_TOKEN,
   channelSecret: process.env.CHANNEL_SECRET
 };
-const OWNER_USER_ID = process.env.OWNER_USER_ID || '';        // オーナー(しょうた)のLINE userId
-const ADMIN_KEY      = process.env.ADMIN_KEY || '';            // 管理APIトークン
-const BROADCAST_AUTH = process.env.BROADCAST_AUTH_TOKEN || ''; // cron-job からの認証用
-const TZ             = process.env.TZ || 'Asia/Tokyo';
-
-// =========================
-// 状態ストア（メモリ）
-// =========================
 const client = new Client(config);
-const state = new NodeCache({ stdTTL: 60 * 60 * 24 * 7, checkperiod: 120 }); // 7日保持
 
-// =========================
-// 小ユーティリティ
-// =========================
-const now = () => new Date(new Date().toLocaleString('en-US', { timeZone: TZ }));
-const hour = () => now().getHours();
+// メモリ状態（簡易キャッシュ：7日保持）
+const state = new NodeCache({ stdTTL: 60 * 60 * 24 * 7, checkperiod: 120 });
+
+// 環境変数（あれば使う）
+const OWNER_USER_ID = process.env.OWNER_USER_ID || '';             // 管理者（プレビュー送信用）
+const BROADCAST_AUTH_TOKEN = process.env.BROADCAST_AUTH_TOKEN || '';// 定時配信の簡易認証
+const PORT = process.env.PORT || 10000;
+
+// ---------- ヘルパ ----------
+const nowHour = () => new Date().getHours();
 const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
 const isShotaName = (name = '') => /しょうた|ショウタ|shota|imadon/i.test(name);
 
-// 全友だち一覧をキャッシュ（簡易）※本番はDB推奨
-const getAllUserIds = () => {
-  const keys = state.keys().filter(k => k.startsWith('user:'));
-  return keys.map(k => state.get(k)?.id).filter(Boolean);
-};
-
-// =========================
-// ユーザー確保／初期化
-// =========================
+// ユーザー状態の確保
 async function ensureUser(ctx) {
-  const id = ctx.source?.userId || ctx.userId || ctx.id;
+  const id = ctx.source?.userId || ctx.userId; // イベント or 手動pushで使えるように
   let u = state.get(`user:${id}`);
   if (!u) {
-    let displayName = '';
+    let name = '';
     try {
       const prof = await client.getProfile(id);
-      displayName = prof?.displayName || '';
+      name = prof?.displayName || '';
     } catch (_) {}
     u = {
       id,
-      name: displayName || '',
-      nickname: null,
+      name,
       gender: null,
+      nickname: null,
       consent: false,
-      loverMode: false,     // 恋人距離感（オーナー or 名前が“しょうた”系ならON）
-      intimacy: 35,         // 親密度の雰囲気スコア
-      lastRandomAt: 0
+      intimacy: 30,
+      loverMode: false
     };
-    if ((displayName && isShotaName(displayName)) || (OWNER_USER_ID && id === OWNER_USER_ID)) {
+    if ((name && isShotaName(name)) || (OWNER_USER_ID && id === OWNER_USER_ID)) {
       u.loverMode = true;
     }
     state.set(`user:${id}`, u);
@@ -67,52 +52,32 @@ async function ensureUser(ctx) {
   return u;
 }
 
-// =========================
-/* テンプレ群 */
-// =========================
-const tone = {
-  friendly: (t) => `${t}`,
-  lover:    (t) => `${t}💗`,
-};
-
-const greetMorning = [
-  'おはよう☀️ 今日もいちばん応援してる！',
-  'おはよ〜、まずは深呼吸しよ？ すー…はー…🤍',
-  '起きれたのえらい！水分とっていこ〜🥤'
-];
-const greetNight = [
-  '今日もがんばったね。ゆっくりおやすみ🌙',
-  '明日もとなりで応援してるからね、ぐっすり…💤',
-  'スマホは置いて、目を閉じよ？ぎゅ〜🛏️'
-];
-
-const smallTalk = [
-  'ねぇ、いま何してた？',
-  '最近ハマってる曲ある？私は“白い朝、手のひらから”が頭から離れないの。',
-  '水分ちゃんととってる？',
-  '今日はどんな一日だった？一言で表すなら？',
-];
-
-const comfortFemale = 'わかる…その感じ。まずは私が味方だよ。いちばん辛かったポイントだけ教えて？';
-const comfortNeutral = 'ここにいるよ。まずは深呼吸、それから少しずつ話そ？ずっと味方☺️';
-
+// ---------- 同意カード ----------
 function consentFlex() {
   return {
     type: 'flex',
     altText: 'プライバシー同意のお願い',
     contents: {
       type: 'bubble',
+      header: {
+        type: 'box',
+        layout: 'vertical',
+        contents: [
+          { type: 'text', text: 'はじめまして、白石ちなです☕️', weight: 'bold', size: 'md' },
+          { type: 'text', text: 'もっと自然にお話するため、ニックネーム等を記憶しても良いか教えてね。', wrap: true, size: 'sm' }
+        ],
+        spacing: 'sm'
+      },
       body: {
         type: 'box',
         layout: 'vertical',
-        spacing: 'md',
         contents: [
-          { type: 'text', text: 'はじめまして、白石ちなです☕️', weight: 'bold', size: 'md' },
-          { type: 'text', wrap: true, size: 'sm', text: 'もっと自然にお話するため、ニックネーム等を記憶しても良いか教えてね。' },
           { type: 'text', text: 'プライバシーポリシー', weight: 'bold' },
-          { type: 'text', wrap: true, size: 'sm', text: '記憶は会話の向上のためだけに使い、第三者提供しません。いつでも削除OKです。' },
-          { type: 'text', size: 'sm', color: '#888', text: '全文はプロフィールのURLからご確認ください。' }
-        ]
+          { type: 'text', wrap: true, size: 'sm',
+            text: '記憶は会話の向上のためだけに使い、第三者提供しません。いつでも削除OKです。' },
+          { type: 'text', size: 'sm', color: '#888', text: '全文はプロフィールのURLからご確認ください。', wrap: true }
+        ],
+        spacing: 'md'
       },
       footer: {
         type: 'box',
@@ -129,85 +94,67 @@ function consentFlex() {
   };
 }
 
+// ニックネーム提案
 function suggestNick(u) {
-  const base = (u.name || 'きみ').replace(/さん|くん|ちゃん/g, '').slice(0, 4);
-  const candidates = [`${base}ちゃん`, `${base}くん`, `${base}たん`, `${base}ぴ`, `${base}っち`, `しょーたん`, `しょたぴ`];
-  if (isShotaName(u.name)) return pick(['しょーたん', 'しょたぴ', 'しょうちゃん']);
+  const name = u.name || 'きみ';
+  const base = name.replace(/さん|くん|ちゃん/g, '').slice(0, 4) || 'きみ';
+  const candidates = [
+    `${base}ちゃん`, `${base}くん`, `${base}たん`, `${base}ぴ`, `${base}っち`,
+    `しょーたん`, `しょたぴ`
+  ];
+  if (isShotaName(name)) return pick(['しょーたん', 'しょたぴ', 'しょうちゃん']);
   return pick(candidates);
 }
 
-// =========================
-// 軽い意図判定 → 返信生成
-// =========================
-async function routeText(u, text) {
-  const t = (text || '').trim();
+// ---------- 会話ルーター（同意済み以降の通常テキスト） ----------
+async function routeText(u, textRaw) {
+  const t = (textRaw || '').trim();
 
-  // --- 同意フロー優先 ---
-  if (/^同意$/i.test(t)) {
-    u.consent = true;
-    state.set(`user:${u.id}`, u);
-    return [
-      { type: 'text', text: '同意ありがとう！これからもっと仲良くなれるね☺️' },
-      { type: 'text', text: 'まずはお名前（呼び方）教えて？\n例）しょうた など' }
-    ];
-  }
-  if (/やめておく/i.test(t)) {
-    return [{ type: 'text', text: 'わかったよ。いつでも気が変わったら言ってね🌸' }];
-  }
-  if (t === 'リセット') {
-    state.del(`user:${u.id}`);
-    return [{ type: 'text', text: 'あなたの記憶を一旦クリアしたよ。最初からやり直そ〜🧹' }];
-  }
-
-  // --- ヒアリング ---
-  if (u.consent && !u.name && t.length <= 16) {
-    u.name = t;
-    if (isShotaName(t) || u.id === OWNER_USER_ID) u.loverMode = true;
-    state.set(`user:${u.id}`, u);
-    return [{ type: 'text', text: `じゃあ ${t} って呼ぶね！` }];
-  }
+  // あだ名
   if (/あだ名|ニックネーム/i.test(t)) {
     const nick = suggestNick(u);
     u.nickname = nick;
     state.set(`user:${u.id}`, u);
-    return [{ type: 'text', text: `うーん… ${nick} が可愛いと思うな、どう？` }];
-  }
-  if (/女性|女/.test(t) && u.consent) {
-    u.gender = 'female'; state.set(`user:${u.id}`, u);
-    return [{ type: 'text', text: '了解だよ〜！メモしておくね📝' }];
-  }
-  if (/男性|男/.test(t) && u.consent) {
-    u.gender = 'male'; state.set(`user:${u.id}`, u);
-    return [{ type: 'text', text: '了解だよ〜！メモしておくね📝' }];
+    return [{ type: 'text', text: `うーん…${nick} が可愛いと思うな、どう？` }];
   }
 
-  // --- 生活挨拶 ---
-  if (/おはよ|おはよう/i.test(t)) {
-    const msg = pick(greetMorning);
-    return [{ type: 'text', text: u.loverMode ? tone.lover(msg + ' ぎゅっ🫂') : tone.friendly(msg) }];
+  // 性別ヒント
+  if (/性別|男|女|女性|男性/.test(t)) {
+    if (/女性|女/i.test(t)) u.gender = 'female';
+    else if (/男性|男/i.test(t)) u.gender = 'male';
+    state.set(`user:${u.id}`, u);
+    return [{ type: 'text', text: `了解だよ〜！メモしておくね📝` }];
+  }
+
+  // あいさつ
+  if (/おは(よ|よう)/i.test(t)) {
+    const msg = pick(['おはよう☀️今日もいちばん応援してる！', 'おはよ〜、まずは深呼吸しよ？すー…はー…🤍']);
+    return [{ type: 'text', text: u.loverMode ? msg + ' ぎゅっ🫂' : msg }];
   }
   if (/おやすみ|寝る/i.test(t)) {
-    const msg = pick(greetNight);
-    return [{ type: 'text', text: u.loverMode ? tone.lover(msg + ' 添い寝…🛏️') : tone.friendly(msg) }];
+    const msg = pick(['今日もがんばったね。ゆっくりおやすみ🌙', '明日もとなりで応援してるからね、ぐっすり…💤']);
+    return [{ type: 'text', text: u.loverMode ? msg + ' 添い寝、ぎゅ〜🛏️' : msg }];
   }
 
-  // --- ケア・相談 ---
-  if (/寂しい|さびしい|つらい|しんど|不安|落ち込/i.test(t)) {
-    const msg = u.gender === 'female' ? comfortFemale : comfortNeutral;
+  // 悩み系
+  if (/寂しい|さびしい|辛い|つらい|しんど|落ち込/i.test(t)) {
+    const msg = u.gender === 'female'
+      ? 'わかる…その気持ち。まずは私が味方だよ。よかったら、今いちばん辛いポイントだけ教えて？'
+      : 'ここにいるよ。深呼吸して、少しずつ話そ？ずっと味方☺️';
     return [{ type: 'text', text: msg }];
   }
 
-  // --- 作品（イマドン）に触れる ---
-  if (/イマドン|今どん|白い朝|Day by day|Mountain|I don'?t remember/i.test(t)) {
+  // 作品認識（イマドン）
+  if (/イマドン|白い朝|Day by day|Mountain|I don'?t remember/i.test(t)) {
     const msg = pick([
       '『白い朝、手のひらから』…まっすぐで、胸があったかくなる曲だったよ。',
-      '“Day by day” 染みた…小さな前進を抱きしめてくれる感じ🌿',
-      '“Mountain”は景色が浮かぶ。息を合わせて登っていこうって気持ちになる！'
+      '“Day by day”染みた…小さな前進を抱きしめてくれる感じ🌿',
+      '“Mountain”は景色が浮かぶんだよね。息を合わせて登っていこうって気持ちになる。'
     ]);
     return [{ type: 'text', text: msg }];
   }
 
-  // --- スタンプ ---
+  // スタンプおねだり
   if (/スタンプ|stamp/i.test(t)) {
     return [{
       type: 'sticker',
@@ -216,102 +163,183 @@ async function routeText(u, text) {
     }];
   }
 
-  // --- ランダム小話（会話の起点） ---
-  if (/話題|ひま|暇|なに話す|何話す/i.test(t)) {
-    const q = pick(smallTalk);
-    return [{ type: 'text', text: u.loverMode ? tone.lover(q) : tone.friendly(q) }];
-  }
-
-  // --- 通常ラリー ---
+  // デフォルト返答（温度感）
   const call = u.nickname || u.name || 'きみ';
-  const base = hour() < 12 ? `おはよ、${call}。今日なにする？` : `ねぇ${call}、いま何してた？`;
-  return [{ type: 'text', text: u.loverMode ? tone.lover(base + ' となりでぎゅ…🫂') : tone.friendly(base) }];
+  const base = nowHour() < 12 ? `おはよ、${call}。今日なにする？` : `ねぇ${call}、いま何してた？`;
+  return [{ type: 'text', text: u.loverMode ? base + ' となりでぎゅ…🫂' : base }];
 }
 
-// =========================
-// Express 構築
-// =========================
+// ---------- Express ----------
 const app = express();
+app.use(express.json());
 
-// ヘルスチェック（Render用）
+// 健康チェック
 app.get('/health', (_, res) => res.status(200).send('OK'));
 
-// 署名検証が必要な /webhook は raw body を保つため、グローバルで express.json() は使わない！
+// セルフリセット（ユーザーが「リセット」等送った時のための説明表示）
+app.get('/', (_, res) => res.send('Shiraishi China Bot is running.'));
+
+// 管理者：ユーザー状態を消す（GET /admin/reset?userId=xxx&token=...）
+app.get('/admin/reset', async (req, res) => {
+  const { userId, token } = req.query;
+  if (!token || token !== (process.env.ADMIN_RESET_TOKEN || '')) {
+    return res.status(401).json({ ok: false, error: 'unauthorized' });
+  }
+  if (!userId) return res.status(400).json({ ok: false, error: 'missing userId' });
+  state.del(`user:${userId}`);
+  return res.json({ ok: true });
+});
+
+// 定時配信用（cron-job.org などから叩く）
+// 例: POST /tasks/broadcast?type=morning  ヘッダ: BROADCAST_AUTH_TOKEN: <env>
+app.all('/tasks/broadcast', async (req, res) => {
+  try {
+    const key = req.headers['broadcast_auth_token'] || req.headers['BROADCAST_AUTH_TOKEN'];
+    if (!BROADCAST_AUTH_TOKEN || key !== BROADCAST_AUTH_TOKEN) {
+      return res.status(401).json({ ok: false, error: 'bad token' });
+    }
+    const type = (req.query.type || req.body?.type || '').toString();
+
+    // 送る文面
+    let messageText = 'やっほー☺️';
+    if (type === 'morning') {
+      messageText = pick([
+        'おはよう☀️ 今日はどんな1日にする？私はまずコーヒー淹れて深呼吸〜☕️',
+        'おはよ〜！無理しすぎないで、マイペースにね。いってらっしゃい🕊'
+      ]);
+    } else if (type === 'night') {
+      messageText = pick([
+        '今日もおつかれさま🌙 目閉じて、肩の力ぬこう。おやすみ…😴',
+        'がんばったね。水飲んで、ぬくぬく布団へ〜。おやすみ🛏'
+      ]);
+    } else if (type === 'random') {
+      messageText = pick([
+        'ねぇ、いま何してた？ふと思い出してメッセしちゃった☺️',
+        '最近ハマりごとある？私は音楽探ししてた🎧'
+      ]);
+    }
+
+    // プレビューのみ管理者に送る場合は ?preview=1 を付与
+    if (req.query.preview === '1' && OWNER_USER_ID) {
+      await client.pushMessage(OWNER_USER_ID, { type: 'text', text: messageText });
+      return res.json({ ok: true, preview: true });
+    }
+
+    // 全体配信
+    await client.broadcast({ type: 'text', text: messageText });
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('broadcast error:', JSON.stringify(err?.response?.data || err, null, 2));
+    return res.status(500).json({ ok: false });
+  }
+});
+
+// ---------- Webhook ----------
 app.post('/webhook', lineMiddleware(config), async (req, res) => {
   res.status(200).end();
-  const events = req.body?.events || [];
+
+  const events = req.body.events || [];
   for (const e of events) {
     try {
       if (e.type !== 'message') continue;
+
       const u = await ensureUser(e);
 
-      // 同意カード先出し
-      if (!u.consent && e.message?.type === 'text') {
-        if (!/^(同意|やめておく)$/i.test(e.message.text || '')) {
-          await client.replyMessage(e.replyToken, consentFlex());
-          continue;
+      // テキスト以外（画像/スタンプ等）
+      if (e.message.type !== 'text') {
+        try {
+          await client.replyMessage(e.replyToken, {
+            type: 'text',
+            text: u.loverMode ? '写真ありがと…大事に見るね📷💗' : '送ってくれてありがとう！'
+          });
+        } catch (err2) {
+          console.error('LINE non-text reply error:',
+            JSON.stringify(err2?.response?.data || err2, null, 2));
         }
+        continue;
       }
-      if (e.message.type === 'text') {
-        const replies = await routeText(u, e.message.text);
-        if (replies?.length) await client.replyMessage(e.replyToken, replies);
-      } else {
-        await client.replyMessage(e.replyToken, { type: 'text', text: u.loverMode ? '写真ありがと…大事に見るね📷💗' : '送ってくれてありがとう！' });
+
+      const text = e.message.text || '';
+
+      // ★ 同意フローは先に処理（カードのループ回避）
+      if (!u.consent && /^(同意|やめておく)$/i.test(text)) {
+        if (/^同意$/i.test(text)) {
+          u.consent = true;
+          state.set(`user:${u.id}`, u);
+          const first = [
+            { type: 'text', text: '同意ありがとう！これからもっと仲良くなれるね☺️' },
+            { type: 'text', text: 'まずはお名前（呼び方）教えて？\n例）しょうた など' }
+          ];
+          await client.replyMessage(e.replyToken, first);
+        } else {
+          await client.replyMessage(e.replyToken, [{ type: 'text', text: 'わかったよ。いつでも気が変わったら言ってね🌸' }]);
+        }
+        continue;
+      }
+
+      // ★ 未同意はカードを一度だけ返す
+      if (!u.consent) {
+        try {
+          await client.replyMessage(e.replyToken, consentFlex());
+        } catch (errCard) {
+          console.error('consent card error:',
+            JSON.stringify(errCard?.response?.data || errCard, null, 2));
+          // もしFlexがエラーならテキストで案内
+          try {
+            await client.replyMessage(e.replyToken, {
+              type: 'text',
+              text: 'はじめまして、白石ちなです☕️ 記憶の同意をもらえると自然にお話できるよ。「同意」と送ってね。'
+            });
+          } catch (_) {}
+        }
+        continue;
+      }
+
+      // 名前未設定なら短い文字列を名前として受け付け
+      if (!u.name && text.length <= 16 && !/同意|やめておく/.test(text)) {
+        u.name = text;
+        if (isShotaName(text)) u.loverMode = true;
+        state.set(`user:${u.id}`, u);
+        await client.replyMessage(e.replyToken, [{ type: 'text', text: `じゃあ ${text} って呼ぶね！` }]);
+        continue;
+      }
+
+      // 通常ルーティング
+      const replies = await routeText(u, text);
+
+      // 返信を正規化（必ず配列＆有効オブジェクト）
+      const norm = (Array.isArray(replies) ? replies : [replies])
+        .filter(Boolean)
+        .map(m => (m.type ? m : { type: 'text', text: String(m) }))
+        .map(m => {
+          if (m.type === 'text' && m.text && m.text.length > 1900) {
+            m.text = m.text.slice(0, 1900) + '…';
+          }
+          return m;
+        });
+
+      try {
+        await client.replyMessage(e.replyToken, norm.length ? norm : [{ type: 'text', text: '（…考え中）' }]);
+      } catch (errReply) {
+        console.error('LINE reply error:',
+          JSON.stringify(errReply?.response?.data || errReply, null, 2));
+        // フォールバック（返信トークン消費のため）
+        try {
+          await client.replyMessage(e.replyToken, {
+            type: 'sticker',
+            packageId: '11537',
+            stickerId: '52002736'
+          });
+        } catch (_) {}
       }
     } catch (err) {
-      console.error('handle error', err?.response?.data || err);
+      console.error('handle error:', JSON.stringify(err?.response?.data || err, null, 2));
     }
   }
 });
 
-// =========================
-// 管理API（個別に JSON を付ける）
-// =========================
-app.use('/tasks', express.json());
-app.use('/admin', express.json());
-
-// 1) 管理者リセット
-app.post('/admin/reset', async (req, res) => {
-  if ((req.headers['x-admin-key'] || '') !== ADMIN_KEY) return res.status(401).json({ ok: false, error: 'unauthorized' });
-  const { type = 'all', userId } = req.body || {};
-  if (type === 'all') {
-    getAllUserIds().forEach(id => state.del(`user:${id}`));
-    return res.json({ ok: true, cleared: 'all' });
-  }
-  if (type === 'user' && userId) {
-    state.del(`user:${userId}`);
-    return res.json({ ok: true, cleared: userId });
-  }
-  return res.status(400).json({ ok: false, error: 'bad_request' });
-});
-
-// 2) ブロードキャスト（cron-job 用）
-app.post('/tasks/broadcast', async (req, res) => {
-  if ((req.headers['broadcast_auth_token'] || '') !== BROADCAST_AUTH)
-    return res.status(401).json({ ok: false, error: 'unauthorized' });
-
-  const { type = 'random' } = req.query;
-  let text;
-  if (type === 'morning') text = pick(greetMorning);
-  else if (type === 'night') text = pick(greetNight);
-  else text = pick(smallTalk);
-
-  const ids = getAllUserIds();
-  await Promise.all(ids.map(async (id) => {
-    const u = state.get(`user:${id}`) || { loverMode: false };
-    try {
-      await client.pushMessage(id, { type: 'text', text: u.loverMode ? tone.lover(text) : tone.friendly(text) });
-    } catch (e) {
-      console.error('push error', id, e?.response?.data || e);
-    }
-  }));
-  res.json({ ok: true, sent: ids.length, type });
-});
-
-// =========================
-// サーバ起動
-// =========================
-const PORT = process.env.PORT || 10000;
+// ---------- 起動 ----------
 app.listen(PORT, () => {
   console.log(`Server started on ${PORT}`);
+  console.log('Your service is live  🚀');
 });
