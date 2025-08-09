@@ -211,31 +211,42 @@ app.get('/health', (_, res) => res.status(200).send('OK'));
 app.post('/webhook', lineMiddleware(config), async (req, res) => {
   res.status(200).end();
   const events = req.body.events || [];
+
   for (const e of events) {
     try {
-      if (e.type !== 'message') continue;
+      // ★ 最初に1回だけ取得
       const u = await ensureUser(e);
+
+      if (e.type !== 'message') continue;
 
       if (e.message.type === 'text') {
         const text = e.message.text || '';
-        // 先に同意だけ通す
+
+        // 同意ワードは先に通す
         if (!u.consent && /^(同意|やめておく)$/i.test(text)) {
           const replies = await handleText(u, text);
           if (replies?.length) await client.replyMessage(e.replyToken, replies);
           continue;
         }
-        // 未同意 → 同意カード
-        if (!u.consent) { await client.replyMessage(e.replyToken, consentFlex()); continue; }
 
+        // 未同意ならカードを返す
+        if (!u.consent) {
+          await client.replyMessage(e.replyToken, consentFlex());
+          continue;
+        }
+
+        // 通常ルーティング
         const replies = await handleText(u, text);
         if (replies?.length) await client.replyMessage(e.replyToken, replies);
         continue;
       }
 
-      // 画像/スタンプ等
-      const u = await ensureUser(e);
-      const msg = u.loverMode ? '写真ありがと…大事に見るね📷💗' : '送ってくれてありがとう！';
+      // 画像/スタンプ等（u を再宣言しない！）
+      const msg = u.loverMode
+        ? '写真ありがと…大事に見るね📷💗'
+        : '送ってくれてありがとう！';
       await client.replyMessage(e.replyToken, { type: 'text', text: msg });
+
     } catch (err) {
       console.error('handle error', err?.response?.data || err);
     }
