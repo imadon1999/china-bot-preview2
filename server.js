@@ -1,4 +1,4 @@
-// server.js — Shiraishi China Bot v1.6
+// server.js — Shiraishi China Bot v1.6.1 (hotfix)
 // 依存: express, dotenv, @line/bot-sdk, node-cache
 // package.json は "type": "module" を推奨
 
@@ -12,8 +12,8 @@ const config = {
   channelAccessToken: process.env.CHANNEL_ACCESS_TOKEN,
   channelSecret:      process.env.CHANNEL_SECRET,
 };
-const OWNER_USER_ID        = process.env.OWNER_USER_ID || '';         // しょうたさんのLINE ID（恋人モード）
-const BROADCAST_AUTH_TOKEN = process.env.BROADCAST_AUTH_TOKEN || '';  // 外部cron用
+const OWNER_USER_ID        = process.env.OWNER_USER_ID || '';
+const BROADCAST_AUTH_TOKEN = process.env.BROADCAST_AUTH_TOKEN || '';
 const PORT = process.env.PORT || 10000;
 
 const app    = express();
@@ -32,6 +32,7 @@ const dayMs = 24*60*60*1000;
 const hr = ()=> new Date().getHours();
 const band = ()=> (hr()<5?'midnight':hr()<12?'morning':hr()<18?'day':'night');
 const isShota = (s='')=>/しょうた|ショウタ|shota|imadon/i.test(s);
+const isGreeting = (t='')=>/(おはよ|こんにちは|こんばんは|やほ|はろ|hi|hello)/i.test(t);
 
 /* ===== 台本（朝10/夜10/日中10） ===== */
 const SCRIPTS = {
@@ -73,7 +74,7 @@ const SCRIPTS = {
   ]
 };
 
-/* ===== 語尾・表情バリエーション（機械感の緩和） ===== */
+/* ===== 語尾バリエーション ===== */
 const ENDINGS = ['。','。','。','！','😊','☺️','🤍','🌸'];
 const LOVERTAIL = [' となりでぎゅ…🫂',' 手つなご？🤝',' ずっと味方だよ💗'];
 const NEUTRALT = [' ちょっと休憩しよ〜',' 水分補給した？',' 無理しすぎないでね。'];
@@ -123,6 +124,11 @@ async function ensureUser(ctx){
       profile:{ relation:'', job:'', hobbies:[] },
       lastSeenAt: now()
     };
+    // ★ オーナーは常に同意済み＆恋人モード固定
+    if (OWNER_USER_ID && id === OWNER_USER_ID) {
+      u.consent = true;
+      u.loverMode = true;
+    }
     state.set(`user:${id}`, u);
     const idx = setIndex(); idx.add(id); saveIndex(idx);
   }
@@ -131,7 +137,7 @@ async function ensureUser(ctx){
 const save = (u)=> state.set(`user:${u.id}`, u);
 const callName = (u)=> (OWNER_USER_ID && u.id===OWNER_USER_ID) ? 'しょうた' : (u.nickname||u.name||'きみ');
 
-/* ===== 気分（簡易）＆セーフティ ===== */
+/* ===== 気分＆セーフティ ===== */
 function moodTap(u,text){
   if (/(つら|しんど|疲れ|寂し|泣|最悪)/i.test(text)) u.mood = Math.max(0, u.mood-10);
   if (/(嬉し|たのし|最高|助か|大好き|良かった)/i.test(text)) u.mood = Math.min(100,u.mood+10);
@@ -148,11 +154,14 @@ function safeRedirect(u){
 /* ===== 同意の誤発火ガード =====
  * ・同意/辞退は完全一致のみ
  * ・過去24hにカード表示したら再表示しない
- * ・会話ターンが一定回数(>=3)ならカード出さない
+ * ・会話ターンが1回以上ならカード出さない
+ * ・挨拶テキストでは出さない
  */
-function shouldShowConsent(u){
+function shouldShowConsent(u, text){
+  if (isGreeting(text)) return false;
+  if (u.turns > 0) return false;
   const shownRecently = (now() - (u.consentShownAt||0)) < dayMs;
-  return !u.consent && !shownRecently && u.turns < 3;
+  return !u.consent && !shownRecently;
 }
 
 /* ===== 相談テンプレ ===== */
@@ -204,8 +213,8 @@ const send = (...m)=> m.filter(Boolean);
 
 async function routeText(u, raw){
   const text = (raw||'').trim();
-  moodTap(u, text);
   if (isSpicy(text)) return safeRedirect(u);
+  moodTap(u, text);
 
   // 完全一致のみ処理
   if (!u.consent && text === '同意'){
@@ -225,13 +234,18 @@ async function routeText(u, raw){
     return [{ type:'text', text:'OK。また気が向いたら声かけてね🌸'}];
   }
 
-  // 未同意 → カード（ガード付き）
+  // 未同意 → ガード付きカード or やんわり案内
   if (!u.consent){
-    if (shouldShowConsent(u)){
+    if (shouldShowConsent(u, text)){
       u.consentShownAt = now(); save(u);
       return [consentFlex()];
     }
-    // それ以外は軽い雑談のみ
+    // 挨拶なら普通に返して、最後にやんわり案内
+    if (isGreeting(text)) {
+      const a = 'お話ししよ〜☺️';
+      const b = '記憶してもOKなら「同意」って送ってね（いつでも削除できるよ）';
+      return send({type:'text', text:a}, {type:'text', text:b});
+    }
     return [{ type:'text', text:'よかったら「同意」と送ってね。いつでもやめられるから安心して🌸'}];
   }
 
@@ -320,7 +334,7 @@ async function routeText(u, raw){
     return [{ type:'sticker', packageId:'11537', stickerId: pick(['52002734','52002736','52002768']) }];
   }
 
-  // デフォ雑談（長め）
+  // デフォ雑談
   const cn = callName(u);
   const lead = band()==='morning'
     ? `おはよ、${cn}。今日なにする？`
@@ -336,11 +350,21 @@ async function routeText(u, raw){
   return send({type:'text', text: soften(lead,u)}, {type:'text', text:follow}, c?{type:'text', text:c}:null);
 }
 
+/* ===== 直近テンプレ重複防止 ===== */
+function pickNonRepeat(u, list, tag){
+  let c = pick(list);
+  if (u.lastScriptTag === tag) {
+    for (let i=0;i<3;i++){ const t = pick(list); if (t!==u.lastScriptTag){ c=t; break; } }
+  }
+  u.lastScriptTag = tag; save(u);
+  return c;
+}
+
 /* ===== ルーティング ===== */
-app.get('/', (_,res)=>res.status(200).send('china-bot v1.6 / OK'));
+app.get('/', (_,res)=>res.status(200).send('china-bot v1.6.1 / OK'));
 app.get('/health', (_,res)=>res.status(200).send('OK'));
 
-// LINE webhook（他の body-parser は噛ませない）
+// LINE webhook
 app.post('/webhook', lineMiddleware(config), async (req,res)=>{
   res.status(200).end();
   const events = req.body.events || [];
@@ -360,13 +384,17 @@ app.post('/webhook', lineMiddleware(config), async (req,res)=>{
           u.turns++; u.lastSeenAt=now(); save(u);
           continue;
         }
+
+        // 通常ルート
         const out = await routeText(u, txt);
         await client.replyMessage(e.replyToken, out);
         u.turns++; u.lastSeenAt=now(); save(u);
+
       }else if (e.message.type==='image'){
         const out = imageReplies(u);
         await client.replyMessage(e.replyToken, out);
         u.turns++; u.lastSeenAt=now(); save(u);
+
       }else{
         await client.replyMessage(e.replyToken, { type:'text', text:'送ってくれてありがとう！' });
         u.turns++; u.lastSeenAt=now(); save(u);
