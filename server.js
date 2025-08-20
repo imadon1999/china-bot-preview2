@@ -42,6 +42,9 @@ const hasUpstash = !!UPSTASH_REDIS_REST_URL && !!UPSTASH_REDIS_REST_TOKEN;
 
 const redis = hasUpstash
   ? new UpstashRedis({ url: UPSTASH_REDIS_REST_URL, token: UPSTASH_REDIS_REST_TOKEN })
+// Upstash の new UpstashRedis(...) の直後
+const STORAGE = redis ? 'upstash' : 'memory';
+console.log(`[storage] mode=${STORAGE}`);
   : null;
 
 // 共通KV
@@ -101,6 +104,20 @@ function intent(text) {
   if (/^女性$|^女$|^男性$|^男$|性別/i.test(t)) return 'gender';
   if (/イマドン|白い朝|day by day|mountain|remember/i.test(t)) return 'song';
   if (/スタンプ|stamp/i.test(t)) return 'sticker';
+// ① 自分の userId を確認（LINE 側ID）
+if (/^id$/i.test(text)) {
+  return [{ type: 'text', text: `your id: ${u.id}` }];
+}
+  
+// ② Redis書き込み→読み出しのワンショットテスト
+if (/^redis\s?test$/i.test(text)) {
+  const key = `debug:${u.id}`;
+  const payload = { ok: true, at: Date.now() };
+  await rset(key, payload);                 // Upstash or memory
+  const back = await rget(key, null);
+  const where = redis ? 'Upstash' : 'Memory';
+  return [{ type: 'text', text: `[${where}] rset/rget OK -> ${JSON.stringify(back)}` }];
+  
   return 'chit_chat';
 }
 
