@@ -4,12 +4,12 @@
 // ENV:
 //   CHANNEL_SECRET
 //   CHANNEL_ACCESS_TOKEN
-//   OWNER_USER_ID                  // あなたのLINE userId（強制同意 & 恋人モード）
-//   BROADCAST_AUTH_TOKEN           // /tasks/broadcast 用 認証ヘッダ
-//   ADMIN_TOKEN                    // /admin/reset 用（任意）
-//   UPSTASH_REDIS_REST_URL         // Upstash URL
-//   UPSTASH_REDIS_REST_TOKEN       // Upstash TOKEN
-//   PORT (省略可: 10000)
+//   OWNER_USER_ID
+//   BROADCAST_AUTH_TOKEN
+//   ADMIN_TOKEN
+//   UPSTASH_REDIS_REST_URL
+//   UPSTASH_REDIS_REST_TOKEN
+//   PORT (optional, default 10000)
 
 import 'dotenv/config';
 import express from 'express';
@@ -42,10 +42,10 @@ const hasUpstash = !!UPSTASH_REDIS_REST_URL && !!UPSTASH_REDIS_REST_TOKEN;
 
 const redis = hasUpstash
   ? new UpstashRedis({ url: UPSTASH_REDIS_REST_URL, token: UPSTASH_REDIS_REST_TOKEN })
-// Upstash の new UpstashRedis(...) の直後
+  : null;
+
 const STORAGE = redis ? 'upstash' : 'memory';
 console.log(`[storage] mode=${STORAGE}`);
-  : null;
 
 // 共通KV
 const rget = async (key, def = null) => {
@@ -56,7 +56,11 @@ const rget = async (key, def = null) => {
 };
 const rset = async (key, val, ttlSec) => {
   try {
-    if (redis) { await (ttlSec ? redis.set(key, val, { ex: ttlSec }) : redis.set(key, val)); return; }
+    if (redis) {
+      if (ttlSec) await redis.set(key, val, { ex: ttlSec });
+      else await redis.set(key, val);
+      return;
+    }
   } catch (e) { console.warn('[upstash:set] fallback -> memory', e?.message || e); }
   mem.set(key, val, ttlSec);
 };
@@ -104,20 +108,6 @@ function intent(text) {
   if (/^女性$|^女$|^男性$|^男$|性別/i.test(t)) return 'gender';
   if (/イマドン|白い朝|day by day|mountain|remember/i.test(t)) return 'song';
   if (/スタンプ|stamp/i.test(t)) return 'sticker';
-// ① 自分の userId を確認（LINE 側ID）
-if (/^id$/i.test(text)) {
-  return [{ type: 'text', text: `your id: ${u.id}` }];
-}
-  
-// ② Redis書き込み→読み出しのワンショットテスト
-if (/^redis\s?test$/i.test(text)) {
-  const key = `debug:${u.id}`;
-  const payload = { ok: true, at: Date.now() };
-  await rset(key, payload);                 // Upstash or memory
-  const back = await rget(key, null);
-  const where = redis ? 'Upstash' : 'Memory';
-  return [{ type: 'text', text: `[${where}] rset/rget OK -> ${JSON.stringify(back)}` }];
-  
   return 'chit_chat';
 }
 
@@ -272,7 +262,6 @@ function safeRedirect(u) {
 }
 
 /* ========= 同意カードの誤発火抑制 ========= */
-// 初回のみ・挨拶除外・turns>0で出さない
 function shouldShowConsent(u, text) {
   if (u.consent) return false;
   if (u.consentCardShown) return false;
@@ -283,14 +272,6 @@ function shouldShowConsent(u, text) {
 
 /* ========= QuickReply ========= */
 const quick = (arr) => ({ items: arr.map(t => ({ type: 'action', action: { type: 'message', label: t, text: t } })) });
-
-/* ========= 相談テンプレ ========= */
-function consultHealth() {
-  return [
-    { type: 'text', text: '健康の話、まずは土台から整えよ☑️' },
-    { type: 'text', text: '睡眠 / 水分 / 食事 / 運動 の4つで、いちばん整えたいのはどれ？', quickReply: quick(['睡眠', '水分', '食事', '運動']) }
-  ];
-}
 
 /* ========= 画像応答 ========= */
 function imageReplies(u) {
@@ -306,6 +287,20 @@ async function routeText(u, raw) {
   const text = (raw || '').trim();
 
   if (isSpicy(text)) return safeRedirect(u);
+
+  // --- デバッグコマンド（任意） ---
+  if (/^id$/i.test(text)) {
+    return [{ type: 'text', text: `your id: ${u.id}` }];
+  }
+  if (/^redis\s?test$/i.test(text)) {
+    const key = `debug:${u.id}`;
+    const payload = { ok: true, at: Date.now() };
+    await rset(key, payload);
+    const back = await rget(key, null);
+    const where = redis ? 'Upstash' : 'Memory';
+    return [{ type: 'text', text: `[${where}] rset/rget OK -> ${JSON.stringify(back)}` }];
+  }
+  // -------------------------------
 
   // 同意/辞退（完全一致）
   if (!u.consent && /^同意$/i.test(text)) {
@@ -497,7 +492,6 @@ app.all('/tasks/broadcast', async (req, res) => {
 });
 
 /* ========= リセット ========= */
-// ユーザー自身の初期化（外部ツールや管理画面から呼ぶ）
 app.post('/reset/me', async (req, res) => {
   const { userId } = req.body || {};
   if (!userId) return res.status(400).json({ ok: false, error: 'userId required' });
@@ -505,7 +499,6 @@ app.post('/reset/me', async (req, res) => {
   res.json({ ok: true });
 });
 
-// 管理者リセット（全削除 or 特定ユーザー）
 app.post('/admin/reset', async (req, res) => {
   const key = req.header('ADMIN_TOKEN') || req.query.key;
   if (!ADMIN_TOKEN || key !== ADMIN_TOKEN) return res.status(403).json({ ok: false });
@@ -521,6 +514,6 @@ app.post('/admin/reset', async (req, res) => {
 });
 
 /* ========= 起動 ========= */
-app.listen(PORT, () => {
+app.listen(Number(PORT), () => {
   console.log(`Server started on ${PORT}`);
 });
