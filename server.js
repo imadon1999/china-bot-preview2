@@ -25,17 +25,61 @@ const lineConfig = {
 };
 const client = new Client(lineConfig);
 
-/* ========= REDIS ========= */
-const redis = createClient({ url: REDIS_URL });
-await redis.connect();
+/* ========= REDIS (Upstash REST + メモリフォールバック) ========= */
+import { Redis as UpstashRedis } from '@upstash/redis';
+import NodeCache from 'node-cache';
 
+const mem = new NodeCache({ stdTTL: 60 * 60 * 24 * 7, checkperiod: 120 });
+
+const hasUpstash =
+  !!process.env.UPSTASH_REDIS_REST_URL && !!process.env.UPSTASH_REDIS_REST_TOKEN;
+
+const redis = hasUpstash
+  ? new UpstashRedis({
+      url: process.env.UPSTASH_REDIS_REST_URL,
+      token: process.env.UPSTASH_REDIS_REST_TOKEN,
+    })
+  : null;
+
+// get / set / del を Upstash 優先、失敗時はメモリにフォールバック
 const rget = async (k, def = null) => {
-  const s = await redis.get(k);
-  return s ? JSON.parse(s) : def;
+  try {
+    if (redis) {
+      const v = await redis.get(k);           // @upstash/redis は自動でJSONデコード
+      return v ?? def;
+    }
+  } catch (e) {
+    console.warn('[upstash:get] fallback -> memory', e?.message || e);
+  }
+  const v = mem.get(k);
+  return v === undefined ? def : v;
 };
-const rset = async (k, v) => { await redis.set(k, JSON.stringify(v)); };
-const rdel = async (k) => { await redis.del(k); };
 
+const rset = async (k, v) => {
+  try {
+    if (redis) {
+      await redis.set(k, v);                  // オブジェクトもOK（自動シリアライズ）
+      return;
+    }
+  } catch (e) {
+    console.warn('[upstash:set] fallback -> memory', e?.message || e);
+  }
+  mem.set(k, v);
+};
+
+const rdel = async (k) => {
+  try {
+    if (redis) {
+      await redis.del(k);
+      return;
+    }
+  } catch (e) {
+    console.warn('[upstash:del] fallback -> memory', e?.message || e);
+  }
+  mem.del(k);
+};
+
+// ここより下の getIndex / addIndex / delIndex はそのままでOK
 async function getIndex() {
   return (await rget('user:index', [])) || [];
 }
@@ -48,7 +92,7 @@ async function addIndex(id) {
 }
 async function delIndex(id) {
   const idx = await getIndex();
-  const next = idx.filter(x => x !== id);
+  const next = idx.filter((x) => x !== id);
   await rset('user:index', next);
 }
 
