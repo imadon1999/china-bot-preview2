@@ -1,72 +1,87 @@
-// server.js — Shiraishi China Bot v1.7 (Upstash Redis persistence)
+// server.js — Shiraishi China Bot v1.8
 // ---------------------------------------------------------------
-// Requires: @line/bot-sdk, express, dotenv, @upstash/redis, node-cache
+// Requires: @line/bot-sdk, express, dotenv, @upstash/redis, node-cache, openai
 // ENV:
 //   CHANNEL_SECRET
 //   CHANNEL_ACCESS_TOKEN
-//   OWNER_USER_ID
-//   BROADCAST_AUTH_TOKEN
-//   ADMIN_TOKEN
+//   OPENAI_API_KEY
 //   UPSTASH_REDIS_REST_URL
 //   UPSTASH_REDIS_REST_TOKEN
-//   PORT (optional, default 10000)
+//   OWNER_USER_ID                 // 任意: あなたの LINE userId（強制同意 & 恋人モード）
+//   BROADCAST_AUTH_TOKEN          // 任意: /tasks/broadcast 用
+//   ADMIN_TOKEN                   // 任意: /admin/reset 用
+//   OPENAI_MODEL                  // 任意: 例 "gpt-4o-mini"
+//   PORT                          // 任意: 既定 10000
 
 import 'dotenv/config';
 import express from 'express';
 import { Client, middleware as lineMiddleware } from '@line/bot-sdk';
 import { Redis as UpstashRedis } from '@upstash/redis';
 import NodeCache from 'node-cache';
+import OpenAI from 'openai';
 
 /* ========= ENV ========= */
 const {
   CHANNEL_SECRET,
   CHANNEL_ACCESS_TOKEN,
+  OPENAI_API_KEY,
+  UPSTASH_REDIS_REST_URL = '',
+  UPSTASH_REDIS_REST_TOKEN = '',
   OWNER_USER_ID = '',
   BROADCAST_AUTH_TOKEN = '',
   ADMIN_TOKEN = '',
-  UPSTASH_REDIS_REST_URL = '',
-  UPSTASH_REDIS_REST_TOKEN = '',
+  OPENAI_MODEL = 'gpt-4o-mini',
   PORT = 10000
 } = process.env;
 
 /* ========= LINE CLIENT ========= */
-const lineConfig = {
+const client = new Client({
   channelSecret: CHANNEL_SECRET,
   channelAccessToken: CHANNEL_ACCESS_TOKEN
-};
-const client = new Client(lineConfig);
+});
+
+/* ========= OpenAI ========= */
+const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
 /* ========= Redis (Upstash) + メモリフォールバック ========= */
 const mem = new NodeCache({ stdTTL: 60 * 60 * 24 * 30, checkperiod: 120 }); // 30日
 const hasUpstash = !!UPSTASH_REDIS_REST_URL && !!UPSTASH_REDIS_REST_TOKEN;
-
 const redis = hasUpstash
   ? new UpstashRedis({ url: UPSTASH_REDIS_REST_URL, token: UPSTASH_REDIS_REST_TOKEN })
   : null;
-
 const STORAGE = redis ? 'upstash' : 'memory';
 console.log(`[storage] mode=${STORAGE}`);
 
 // 共通KV
 const rget = async (key, def = null) => {
   try {
-    if (redis) { const v = await redis.get(key); return v ?? def; }
-  } catch (e) { console.warn('[upstash:get] fallback -> memory', e?.message || e); }
-  const v = mem.get(key); return v === undefined ? def : v;
+    if (redis) {
+      const v = await redis.get(key); // 自動JSONデコード
+      return v ?? def;
+    }
+  } catch (e) {
+    console.warn('[upstash:get] fallback -> memory', e?.message || e);
+  }
+  const v = mem.get(key);
+  return v === undefined ? def : v;
 };
 const rset = async (key, val, ttlSec) => {
   try {
     if (redis) {
-      if (ttlSec) await redis.set(key, val, { ex: ttlSec });
-      else await redis.set(key, val);
+      await (ttlSec ? redis.set(key, val, { ex: ttlSec }) : redis.set(key, val));
       return;
     }
-  } catch (e) { console.warn('[upstash:set] fallback -> memory', e?.message || e); }
+  } catch (e) {
+    console.warn('[upstash:set] fallback -> memory', e?.message || e);
+  }
   mem.set(key, val, ttlSec);
 };
 const rdel = async (key) => {
-  try { if (redis) { await redis.del(key); return; } }
-  catch (e) { console.warn('[upstash:del] fallback -> memory', e?.message || e); }
+  try {
+    if (redis) { await redis.del(key); return; }
+  } catch (e) {
+    console.warn('[upstash:del] fallback -> memory', e?.message || e);
+  }
   mem.del(key);
 };
 
@@ -77,16 +92,17 @@ async function addIndex(id) {
   if (!idx.includes(id)) { idx.push(id); await rset('user:index', idx); }
 }
 async function delIndex(id) {
-  const idx = await getIndex(); await rset('user:index', idx.filter(x => x !== id));
+  const idx = await getIndex();
+  await rset('user:index', idx.filter(x => x !== id));
 }
 
-// ユーザー状態
+// ユーザー状態（セッション）
 const userKey = (id) => `user:${id}`;
 async function loadUser(id) { return await rget(userKey(id), null); }
 async function saveUser(u, ttlSec = 60 * 60 * 24 * 30) { await rset(userKey(u.id), u, ttlSec); }
 async function deleteUser(id) { await rdel(userKey(id)); await delIndex(id); }
 
-/* ========= UTILS & INTENT ========= */
+/* ========= UTILS ========= */
 const now = () => Date.now();
 const hr = () => new Date().getHours();
 const band = () => (hr() < 5 ? 'midnight' : hr() < 12 ? 'morning' : hr() < 18 ? 'day' : 'night');
@@ -96,20 +112,6 @@ const chance = (p = 0.5) => Math.random() < p;
 const isShota = (s = '') => /しょうた|ショウタ|ｼｮｳﾀ|shota|Shota|imadon/i.test(s);
 const isGreeting = (t = '') => /(おはよ|おはよう|こんにちは|こんばんは|やほ|はろ|hi|hello)/i.test(t);
 const isSpicy = (t = '') => /(えっち|性的|抱いて|脚で|足で|添い寝して)/i.test(t);
-
-function intent(text) {
-  const t = (text || '').trim();
-  if (/^(同意|やめておく)$/i.test(t)) return 'consent';
-  if (/^reset$/i.test(t)) return 'self_reset';
-  if (/おはよ|おはよう/i.test(t)) return 'morning';
-  if (/おやすみ|寝る|ねむ/i.test(t)) return 'night';
-  if (/寂しい|さみしい|つらい|しんど|不安/i.test(t)) return 'comfort';
-  if (/あだ名|ニックネーム|呼んで/i.test(t)) return 'nickname';
-  if (/^女性$|^女$|^男性$|^男$|性別/i.test(t)) return 'gender';
-  if (/イマドン|白い朝|day by day|mountain|remember/i.test(t)) return 'song';
-  if (/スタンプ|stamp/i.test(t)) return 'sticker';
-  return 'chit_chat';
-}
 
 /* ========= 台本 ========= */
 const SCRIPTS = {
@@ -242,6 +244,7 @@ async function ensureUser(ctx) {
       consent: false, consentCardShown: false, consentShownAt: 0,
       turns: 0, loverMode: !!(OWNER_USER_ID && id === OWNER_USER_ID) || isShota(name),
       mood: 60,
+      hist: [],                                  // ChatGPT 用 直近の会話履歴
       onboarding: { asked: false, step: 0 },
       profile: { relation: '', job: '', hobbies: [] },
       lastSeenAt: now()
@@ -282,25 +285,69 @@ function imageReplies(u) {
   ];
 }
 
+/* ========= ChatGPT 応答 ========= */
+function personaSystem(u) {
+  const cn = callName(u);
+  const lover = u.loverMode ? '恋人モード（やさしく甘め、ちょっとだけスキンシップ表現OK）' :
+                              'フレンドモード（丁寧すぎず、やさしく）';
+  return [
+    'あなたは「白石ちな」。一人称は「私」。日本語で温かく、短すぎない返事を作る。',
+    `相手の呼称は「${cn}」。トーンは${lover}。敬語とタメ口を自然に混ぜてOK。`,
+    '禁止: 露骨/成人向け表現、個人情報要求、差別、医療・法律の断定。',
+    '返答は1〜3文。必要なら相手に1つだけ優しい質問を返す。',
+    '絵文字は1〜2個まで。乱用しない。',
+  ].join('\n');
+}
+
+function trimHist(hist = [], maxTurns = 12) {
+  // hist: [{role:'user'|'assistant', content: '...'}]
+  const copy = Array.isArray(hist) ? [...hist] : [];
+  while (copy.length > maxTurns * 2) copy.shift();
+  return copy;
+}
+
+async function aiReply(u, userText) {
+  const messages = [
+    { role: 'system', content: personaSystem(u) },
+    ...(trimHist(u.hist).map(h => ({ role: h.role, content: h.content }))),
+    { role: 'user', content: userText }
+  ];
+  try {
+    const resp = await openai.chat.completions.create({
+      model: OPENAI_MODEL,        // 例: gpt-4o-mini
+      messages,
+      temperature: 0.9,
+      max_tokens: 220
+    });
+    const out = resp?.choices?.[0]?.message?.content?.trim() || '';
+    return out || 'うん、ちゃんと聞いてるよ。もう少し詳しく教えて？';
+  } catch (e) {
+    console.error('openai error', e?.response?.data || e?.message || e);
+    return null; // 失敗時はテンプレにフォールバック
+  }
+}
+
 /* ========= テキストルーティング ========= */
+function intent(text) {
+  const t = (text || '').trim();
+  if (/^(同意|やめておく)$/i.test(t)) return 'consent';
+  if (/^reset$/i.test(t)) return 'self_reset';
+  if (/^id$/i.test(t)) return 'whoami';
+  if (/^redis\s?test$/i.test(t)) return 'redis_test';
+  if (/おはよ|おはよう/i.test(t)) return 'morning';
+  if (/おやすみ|寝る|ねむ/i.test(t)) return 'night';
+  if (/寂しい|さみしい|つらい|しんど|不安/i.test(t)) return 'comfort';
+  if (/あだ名|ニックネーム|呼んで/i.test(t)) return 'nickname';
+  if (/^女性$|^女$|^男性$|^男$|性別/i.test(t)) return 'gender';
+  if (/イマドン|白い朝|day by day|mountain|remember/i.test(t)) return 'song';
+  if (/スタンプ|stamp/i.test(t)) return 'sticker';
+  return 'chit_chat';
+}
+
 async function routeText(u, raw) {
   const text = (raw || '').trim();
 
   if (isSpicy(text)) return safeRedirect(u);
-
-  // --- デバッグコマンド（任意） ---
-  if (/^id$/i.test(text)) {
-    return [{ type: 'text', text: `your id: ${u.id}` }];
-  }
-  if (/^redis\s?test$/i.test(text)) {
-    const key = `debug:${u.id}`;
-    const payload = { ok: true, at: Date.now() };
-    await rset(key, payload);
-    const back = await rget(key, null);
-    const where = redis ? 'Upstash' : 'Memory';
-    return [{ type: 'text', text: `[${where}] rset/rget OK -> ${JSON.stringify(back)}` }];
-  }
-  // -------------------------------
 
   // 同意/辞退（完全一致）
   if (!u.consent && /^同意$/i.test(text)) {
@@ -355,7 +402,17 @@ async function routeText(u, raw) {
     await deleteUser(u.id);
     return [{ type: 'text', text: '会話の記憶を初期化したよ！また最初から仲良くしてね☺️' }];
   }
-
+  if (kind === 'whoami') {
+    return [{ type: 'text', text: `your id: ${u.id}` }];
+  }
+  if (kind === 'redis_test') {
+    const key = `debug:${u.id}`;
+    const payload = { ok: true, at: Date.now() };
+    await rset(key, payload);
+    const back = await rget(key, null);
+    const where = redis ? 'Upstash' : 'Memory';
+    return [{ type: 'text', text: `[${where}] rset/rget OK -> ${JSON.stringify(back)}` }];
+  }
   if (kind === 'nickname') {
     const base = (callName(u) || 'きみ').replace(/さん|くん|ちゃん/g, '').slice(0, 4) || 'きみ';
     const cands = isShota(u.name)
@@ -365,14 +422,12 @@ async function routeText(u, raw) {
     u.nickname = nick; await saveUser(u);
     return [{ type: 'text', text: `…${nick} が可愛いと思うな。どう？` }];
   }
-
   if (kind === 'gender') {
     if (/女性|女/.test(text)) u.gender = 'female';
     else if (/男性|男/.test(text)) u.gender = 'male';
     await saveUser(u);
     return [{ type: 'text', text: '了解だよ〜📝 メモしておくね。' }];
   }
-
   if (kind === 'morning') {
     const a = await pickNonRepeat(u, SCRIPTS.morning, 'morning');
     return [{ type: 'text', text: soften(a, u) }];
@@ -381,14 +436,12 @@ async function routeText(u, raw) {
     const a = await pickNonRepeat(u, SCRIPTS.night, 'night');
     return [{ type: 'text', text: soften(a, u) }];
   }
-
   if (kind === 'comfort') {
     const msg = (u.gender === 'female')
       ? 'わかる…その気持ち。まずは私が味方だよ。いちばん辛いポイントだけ教えて？'
       : 'ここにいるよ。まずは深呼吸、それから少しずつ話そ？ずっと味方☺️';
     return [{ type: 'text', text: msg }];
   }
-
   if (kind === 'song') {
     const a = pick([
       '『白い朝、手のひらから』…まっすぐで胸が温かくなる曲、好き。',
@@ -399,12 +452,20 @@ async function routeText(u, raw) {
     const b = { type: 'text', text: '次に推したい曲、いっしょに決めよ？' };
     return [{ type: 'text', text: soften(a, u) }, b];
   }
-
   if (kind === 'sticker') {
     return [{ type: 'sticker', packageId: '11537', stickerId: pick(['52002734','52002736','52002768']) }];
   }
 
-  // デフォ雑談：時間帯＆恋人トーン
+  // —— ここから ChatGPT で自然会話 ——
+  const ai = await aiReply(u, text);
+  if (ai) {
+    // 履歴更新
+    u.hist = trimHist([...(u.hist || []), { role: 'user', content: text }, { role: 'assistant', content: ai }]);
+    await saveUser(u);
+    return [{ type: 'text', text: ai }];
+  }
+
+  // LLM障害時フォールバック（時間帯リード + 追い質問）
   const cn = callName(u);
   const lead = band() === 'morning'
     ? `おはよ、${cn}。今日なにする？`
@@ -428,7 +489,7 @@ async function routeText(u, raw) {
 /* ========= EXPRESS ========= */
 const app = express();
 
-app.get('/', (_, res) => res.status(200).send('china-bot v1.7 / OK'));
+app.get('/', (_, res) => res.status(200).send('china-bot v1.8 / OK'));
 app.get('/health', (_, res) => res.status(200).send('OK'));
 
 // ★ webhook より前では express.json() を使わない（署名検証エラー対策）
@@ -461,11 +522,11 @@ app.post('/webhook', lineMiddleware({ channelSecret: CHANNEL_SECRET }), async (r
   }
 });
 
-// webhook以外はJSON OK
+// webhook 以外は JSON OK
 app.use('/tasks', express.json());
 app.use('/admin', express.json());
 
-/* ========= ブロードキャスト =========
+/* ========= ブロードキャスト（cron-job用） =========
    POST/GET /tasks/broadcast?type=morning|night|random
    Header: BROADCAST_AUTH_TOKEN: <env>
 */
@@ -492,6 +553,7 @@ app.all('/tasks/broadcast', async (req, res) => {
 });
 
 /* ========= リセット ========= */
+// ユーザー自身の初期化（外部ツールや管理画面から呼ぶ）
 app.post('/reset/me', async (req, res) => {
   const { userId } = req.body || {};
   if (!userId) return res.status(400).json({ ok: false, error: 'userId required' });
@@ -499,6 +561,7 @@ app.post('/reset/me', async (req, res) => {
   res.json({ ok: true });
 });
 
+// 管理者リセット（全削除 or 特定ユーザー）
 app.post('/admin/reset', async (req, res) => {
   const key = req.header('ADMIN_TOKEN') || req.query.key;
   if (!ADMIN_TOKEN || key !== ADMIN_TOKEN) return res.status(403).json({ ok: false });
@@ -514,6 +577,6 @@ app.post('/admin/reset', async (req, res) => {
 });
 
 /* ========= 起動 ========= */
-app.listen(Number(PORT), () => {
+app.listen(PORT, () => {
   console.log(`Server started on ${PORT}`);
 });
