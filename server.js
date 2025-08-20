@@ -1,20 +1,31 @@
-// server.js — Shiraishi China Bot v1.7 (Redis persistence + consent guard)
-// Author: you & China-bot project
-// Requires: express, dotenv, @line/bot-sdk, redis (node-redis v4)
+// server.js — Shiraishi China Bot v1.7 (Upstash Redis persistence)
+// ---------------------------------------------------------------
+// Requires: @line/bot-sdk, express, dotenv, @upstash/redis, node-cache
+// ENV:
+//   CHANNEL_SECRET
+//   CHANNEL_ACCESS_TOKEN
+//   OWNER_USER_ID                  // あなたのLINE userId（強制同意 & 恋人モード）
+//   BROADCAST_AUTH_TOKEN           // /tasks/broadcast 用 認証ヘッダ
+//   ADMIN_TOKEN                    // /admin/reset 用（任意）
+//   UPSTASH_REDIS_REST_URL         // Upstash URL
+//   UPSTASH_REDIS_REST_TOKEN       // Upstash TOKEN
+//   PORT (省略可: 10000)
 
 import 'dotenv/config';
 import express from 'express';
 import { Client, middleware as lineMiddleware } from '@line/bot-sdk';
-import { createClient } from 'redis';
+import { Redis as UpstashRedis } from '@upstash/redis';
+import NodeCache from 'node-cache';
 
 /* ========= ENV ========= */
 const {
   CHANNEL_SECRET,
   CHANNEL_ACCESS_TOKEN,
-  OWNER_USER_ID = '',            // あなたのLINE userId（恋人モード＆常に同意扱い）
-  BROADCAST_AUTH_TOKEN = '',     // /tasks/broadcast 認証ヘッダ
-  ADMIN_TOKEN = '',              // /admin/reset 認証（任意）
-  REDIS_URL,                     // Upstashなどの接続URL
+  OWNER_USER_ID = '',
+  BROADCAST_AUTH_TOKEN = '',
+  ADMIN_TOKEN = '',
+  UPSTASH_REDIS_REST_URL = '',
+  UPSTASH_REDIS_REST_TOKEN = '',
   PORT = 10000
 } = process.env;
 
@@ -25,78 +36,50 @@ const lineConfig = {
 };
 const client = new Client(lineConfig);
 
-/* ========= REDIS (Upstash REST + メモリフォールバック) ========= */
-import { Redis as UpstashRedis } from '@upstash/redis';
-import NodeCache from 'node-cache';
-
-const mem = new NodeCache({ stdTTL: 60 * 60 * 24 * 7, checkperiod: 120 });
-
-const hasUpstash =
-  !!process.env.UPSTASH_REDIS_REST_URL && !!process.env.UPSTASH_REDIS_REST_TOKEN;
+/* ========= Redis (Upstash) + メモリフォールバック ========= */
+const mem = new NodeCache({ stdTTL: 60 * 60 * 24 * 30, checkperiod: 120 }); // 30日
+const hasUpstash = !!UPSTASH_REDIS_REST_URL && !!UPSTASH_REDIS_REST_TOKEN;
 
 const redis = hasUpstash
-  ? new UpstashRedis({
-      url: process.env.UPSTASH_REDIS_REST_URL,
-      token: process.env.UPSTASH_REDIS_REST_TOKEN,
-    })
+  ? new UpstashRedis({ url: UPSTASH_REDIS_REST_URL, token: UPSTASH_REDIS_REST_TOKEN })
   : null;
 
-// get / set / del を Upstash 優先、失敗時はメモリにフォールバック
-const rget = async (k, def = null) => {
+// 共通KV
+const rget = async (key, def = null) => {
   try {
-    if (redis) {
-      const v = await redis.get(k);           // @upstash/redis は自動でJSONデコード
-      return v ?? def;
-    }
-  } catch (e) {
-    console.warn('[upstash:get] fallback -> memory', e?.message || e);
-  }
-  const v = mem.get(k);
-  return v === undefined ? def : v;
+    if (redis) { const v = await redis.get(key); return v ?? def; }
+  } catch (e) { console.warn('[upstash:get] fallback -> memory', e?.message || e); }
+  const v = mem.get(key); return v === undefined ? def : v;
+};
+const rset = async (key, val, ttlSec) => {
+  try {
+    if (redis) { await (ttlSec ? redis.set(key, val, { ex: ttlSec }) : redis.set(key, val)); return; }
+  } catch (e) { console.warn('[upstash:set] fallback -> memory', e?.message || e); }
+  mem.set(key, val, ttlSec);
+};
+const rdel = async (key) => {
+  try { if (redis) { await redis.del(key); return; } }
+  catch (e) { console.warn('[upstash:del] fallback -> memory', e?.message || e); }
+  mem.del(key);
 };
 
-const rset = async (k, v) => {
-  try {
-    if (redis) {
-      await redis.set(k, v);                  // オブジェクトもOK（自動シリアライズ）
-      return;
-    }
-  } catch (e) {
-    console.warn('[upstash:set] fallback -> memory', e?.message || e);
-  }
-  mem.set(k, v);
-};
-
-const rdel = async (k) => {
-  try {
-    if (redis) {
-      await redis.del(k);
-      return;
-    }
-  } catch (e) {
-    console.warn('[upstash:del] fallback -> memory', e?.message || e);
-  }
-  mem.del(k);
-};
-
-// ここより下の getIndex / addIndex / delIndex はそのままでOK
-async function getIndex() {
-  return (await rget('user:index', [])) || [];
-}
+// ブロードキャスト用インデックス
+async function getIndex() { return (await rget('user:index', [])) || []; }
 async function addIndex(id) {
   const idx = await getIndex();
-  if (!idx.includes(id)) {
-    idx.push(id);
-    await rset('user:index', idx);
-  }
+  if (!idx.includes(id)) { idx.push(id); await rset('user:index', idx); }
 }
 async function delIndex(id) {
-  const idx = await getIndex();
-  const next = idx.filter((x) => x !== id);
-  await rset('user:index', next);
+  const idx = await getIndex(); await rset('user:index', idx.filter(x => x !== id));
 }
 
-/* ========= UTILS ========= */
+// ユーザー状態
+const userKey = (id) => `user:${id}`;
+async function loadUser(id) { return await rget(userKey(id), null); }
+async function saveUser(u, ttlSec = 60 * 60 * 24 * 30) { await rset(userKey(u.id), u, ttlSec); }
+async function deleteUser(id) { await rdel(userKey(id)); await delIndex(id); }
+
+/* ========= UTILS & INTENT ========= */
 const now = () => Date.now();
 const hr = () => new Date().getHours();
 const band = () => (hr() < 5 ? 'midnight' : hr() < 12 ? 'morning' : hr() < 18 ? 'day' : 'night');
@@ -106,6 +89,20 @@ const chance = (p = 0.5) => Math.random() < p;
 const isShota = (s = '') => /しょうた|ショウタ|ｼｮｳﾀ|shota|Shota|imadon/i.test(s);
 const isGreeting = (t = '') => /(おはよ|おはよう|こんにちは|こんばんは|やほ|はろ|hi|hello)/i.test(t);
 const isSpicy = (t = '') => /(えっち|性的|抱いて|脚で|足で|添い寝して)/i.test(t);
+
+function intent(text) {
+  const t = (text || '').trim();
+  if (/^(同意|やめておく)$/i.test(t)) return 'consent';
+  if (/^reset$/i.test(t)) return 'self_reset';
+  if (/おはよ|おはよう/i.test(t)) return 'morning';
+  if (/おやすみ|寝る|ねむ/i.test(t)) return 'night';
+  if (/寂しい|さみしい|つらい|しんど|不安/i.test(t)) return 'comfort';
+  if (/あだ名|ニックネーム|呼んで/i.test(t)) return 'nickname';
+  if (/^女性$|^女$|^男性$|^男$|性別/i.test(t)) return 'gender';
+  if (/イマドン|白い朝|day by day|mountain|remember/i.test(t)) return 'song';
+  if (/スタンプ|stamp/i.test(t)) return 'sticker';
+  return 'chit_chat';
+}
 
 /* ========= 台本 ========= */
 const SCRIPTS = {
@@ -120,7 +117,6 @@ const SCRIPTS = {
     'おはよ！ しょうた、今日は何か楽しみある？ あったら絶対教えてね',
     'しょうた、おはよ〜。私ね、朝のしょうたの声が一番好きかも',
     'おはよ、しょうた！ 昨日より今日、もっと好きになっちゃった…',
-    // 追加10
     '今日は“ひとつだけ”がんばること教えて？',
     'まぶた重い？お水一杯どうぞ☕️ 私が「おはようの一口」あげたいな',
     '窓あけて光あびよ？吸って、吐いて…今日もいける🌿',
@@ -143,7 +139,6 @@ const SCRIPTS = {
     'しょうた、おやすみ💤 明日の朝もちゃんと起こしてあげるからね',
     'おやすみ、しょうた。今日はどんな夢見たい？',
     'しょうた、眠る前に一言だけ…愛してるよ',
-    // 追加10
     'まずはお水一杯のんで〜',
     '“なでなでされたい度”何％？100％なら両手で包む🫶',
     'ベッドで横になって10秒だけ目つむろ？今一緒に数えるね',
@@ -166,7 +161,6 @@ const SCRIPTS = {
     'しょうた、最近ハマってることある？',
     'しょうた、もし私が隣にいたら何する？',
     'しょうた、会えない時間ってどうしてこんなに長く感じるんだろうね',
-    // 追加10
     '今日の空、なん色だった？',
     '最近“ほめてもらえたこと”あった？',
     '5分だけ散歩いく？戻ったら褒めちぎるよ',
@@ -213,7 +207,7 @@ const consentFlex = () => ({
   }
 });
 
-/* ========= 直近重複回避（ユーザー別） ========= */
+/* ========= 直近重複回避 ========= */
 async function pickNonRepeat(u, list, tag) {
   const key = `nr:${u.id}:${tag}`;
   const last = await rget(key, null);
@@ -224,19 +218,13 @@ async function pickNonRepeat(u, list, tag) {
 }
 
 /* ========= ユーザー管理 ========= */
-async function loadUser(id) {
-  return await rget(`user:${id}`, null);
-}
-async function saveUser(u) {
-  await rset(`user:${u.id}`, u);
-}
 function callName(u) {
   return (OWNER_USER_ID && u.id === OWNER_USER_ID) ? 'しょうた' : (u.nickname || u.name || 'きみ');
 }
-
 async function ensureUser(ctx) {
   const id = ctx.source?.userId || ctx.userId || '';
   if (!id) return null;
+
   let u = await loadUser(id);
   if (!u) {
     let name = '';
@@ -251,11 +239,7 @@ async function ensureUser(ctx) {
       profile: { relation: '', job: '', hobbies: [] },
       lastSeenAt: now()
     };
-    // オーナーは常に同意済み＆恋人モード
-    if (OWNER_USER_ID && id === OWNER_USER_ID) {
-      u.consent = true;
-      u.loverMode = true;
-    }
+    if (OWNER_USER_ID && id === OWNER_USER_ID) { u.consent = true; u.loverMode = true; }
     await saveUser(u);
     await addIndex(id);
   }
@@ -270,7 +254,7 @@ function safeRedirect(u) {
   return [{ type: 'text', text: a }, { type: 'text', text: b }, { type: 'text', text: c }];
 }
 
-/* ========= 同意カードの表示判定 ========= */
+/* ========= 同意カードの誤発火抑制 ========= */
 // 初回のみ・挨拶除外・turns>0で出さない
 function shouldShowConsent(u, text) {
   if (u.consent) return false;
@@ -284,12 +268,6 @@ function shouldShowConsent(u, text) {
 const quick = (arr) => ({ items: arr.map(t => ({ type: 'action', action: { type: 'message', label: t, text: t } })) });
 
 /* ========= 相談テンプレ ========= */
-function consultCareer() {
-  return [
-    { type: 'text', text: 'いまの状況を一緒に整理しよ📝 次の3つを1行ずつ教えて？' },
-    { type: 'text', text: '① 現職の不満\n② 欲しい条件\n③ 期限感', quickReply: quick(['整理→質問して', '共感→聞いてほしい', '解決案→提案して']) }
-  ];
-}
 function consultHealth() {
   return [
     { type: 'text', text: '健康の話、まずは土台から整えよ☑️' },
@@ -306,27 +284,13 @@ function imageReplies(u) {
   ];
 }
 
-/* ========= ルーター ========= */
-function intent(text) {
-  const t = (text || '').trim();
-  if (/^(同意|やめておく)$/i.test(t)) return 'consent';
-  if (/^reset$/i.test(t)) return 'self_reset';
-  if (/おはよ|おはよう/i.test(t)) return 'morning';
-  if (/おやすみ|寝る|ねむ/i.test(t)) return 'night';
-  if (/寂しい|さみしい|つらい|しんど|不安/i.test(t)) return 'comfort';
-  if (/あだ名|ニックネーム|呼んで/i.test(t)) return 'nickname';
-  if (/^女性$|^女$|^男性$|^男$|性別/i.test(t)) return 'gender';
-  if (/イマドン|白い朝|day by day|mountain|remember/i.test(t)) return 'song';
-  if (/スタンプ|stamp/i.test(t)) return 'sticker';
-  return 'chit_chat';
-}
-
-async function routeText(u, textRaw) {
-  const text = (textRaw || '').trim();
+/* ========= テキストルーティング ========= */
+async function routeText(u, raw) {
+  const text = (raw || '').trim();
 
   if (isSpicy(text)) return safeRedirect(u);
 
-  // 同意/辞退（完全一致のみ）
+  // 同意/辞退（完全一致）
   if (!u.consent && /^同意$/i.test(text)) {
     u.consent = true; await saveUser(u);
     if (OWNER_USER_ID && u.id === OWNER_USER_ID) {
@@ -352,7 +316,6 @@ async function routeText(u, textRaw) {
       await saveUser(u);
       return [consentFlex()];
     }
-    // 挨拶は軽い返答＋案内
     if (isGreeting(text)) {
       return [
         { type: 'text', text: 'お話ししよ〜☺️' },
@@ -377,7 +340,7 @@ async function routeText(u, textRaw) {
   const kind = intent(text);
 
   if (kind === 'self_reset') {
-    await rdel(`user:${u.id}`); await delIndex(u.id);
+    await deleteUser(u.id);
     return [{ type: 'text', text: '会話の記憶を初期化したよ！また最初から仲良くしてね☺️' }];
   }
 
@@ -456,7 +419,7 @@ const app = express();
 app.get('/', (_, res) => res.status(200).send('china-bot v1.7 / OK'));
 app.get('/health', (_, res) => res.status(200).send('OK'));
 
-// Webhook（※先に json() を使わない）
+// ★ webhook より前では express.json() を使わない（署名検証エラー対策）
 app.post('/webhook', lineMiddleware({ channelSecret: CHANNEL_SECRET }), async (req, res) => {
   res.status(200).end();
   const events = req.body.events || [];
@@ -469,32 +432,28 @@ app.post('/webhook', lineMiddleware({ channelSecret: CHANNEL_SECRET }), async (r
       if (e.message.type === 'text') {
         const out = await routeText(u, e.message.text || '');
         if (out?.length) await client.replyMessage(e.replyToken, out);
-        u.turns = (u.turns || 0) + 1;
-        u.lastSeenAt = now();
-        await saveUser(u);
       } else if (e.message.type === 'image') {
         const out = imageReplies(u);
         await client.replyMessage(e.replyToken, out);
-        u.turns = (u.turns || 0) + 1;
-        u.lastSeenAt = now();
-        await saveUser(u);
       } else {
         await client.replyMessage(e.replyToken, { type: 'text', text: '送ってくれてありがとう！' });
-        u.turns = (u.turns || 0) + 1;
-        u.lastSeenAt = now();
-        await saveUser(u);
       }
+
+      // 共通のターン更新
+      u.turns = (u.turns || 0) + 1;
+      u.lastSeenAt = now();
+      await saveUser(u);
     } catch (err) {
       console.error('reply error', err?.response?.status || '-', err?.response?.data || err);
     }
   }
 });
 
-// 以降のルートは JSON OK
+// webhook以外はJSON OK
 app.use('/tasks', express.json());
 app.use('/admin', express.json());
 
-/* ========= ブロードキャスト（cron-jobから叩く） =========
+/* ========= ブロードキャスト =========
    POST/GET /tasks/broadcast?type=morning|night|random
    Header: BROADCAST_AUTH_TOKEN: <env>
 */
@@ -509,7 +468,6 @@ app.all('/tasks/broadcast', async (req, res) => {
     const idx = await getIndex();
     if (!idx.length) return res.json({ ok: true, sent: 0 });
 
-    // 同じ文面を一斉配信（運用簡素版）
     const text = pick(pool);
     const msg = [{ type: 'text', text }];
 
@@ -522,27 +480,26 @@ app.all('/tasks/broadcast', async (req, res) => {
 });
 
 /* ========= リセット ========= */
+// ユーザー自身の初期化（外部ツールや管理画面から呼ぶ）
 app.post('/reset/me', async (req, res) => {
   const { userId } = req.body || {};
   if (!userId) return res.status(400).json({ ok: false, error: 'userId required' });
-  await rdel(`user:${userId}`);
-  await delIndex(userId);
+  await deleteUser(userId);
   res.json({ ok: true });
 });
 
+// 管理者リセット（全削除 or 特定ユーザー）
 app.post('/admin/reset', async (req, res) => {
   const key = req.header('ADMIN_TOKEN') || req.query.key;
   if (!ADMIN_TOKEN || key !== ADMIN_TOKEN) return res.status(403).json({ ok: false });
 
   const { userId } = req.body || {};
   if (userId) {
-    await rdel(`user:${userId}`);
-    await delIndex(userId);
+    await deleteUser(userId);
     return res.json({ ok: true, target: userId });
   }
   const idx = await getIndex();
-  await Promise.allSettled(idx.map(id => rdel(`user:${id}`)));
-  await rset('user:index', []);
+  await Promise.allSettled(idx.map(id => deleteUser(id)));
   res.json({ ok: true, cleared: idx.length });
 });
 
