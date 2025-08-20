@@ -1,62 +1,64 @@
-// server.js — Shiraishi China Bot v1.8
-// ---------------------------------------------------------------
-// Requires: @line/bot-sdk, express, dotenv, @upstash/redis, node-cache, openai
-// ENV:
-//   CHANNEL_SECRET
-//   CHANNEL_ACCESS_TOKEN
-//   OPENAI_API_KEY
-//   UPSTASH_REDIS_REST_URL
-//   UPSTASH_REDIS_REST_TOKEN
-//   OWNER_USER_ID                 // 任意: あなたの LINE userId（強制同意 & 恋人モード）
-//   BROADCAST_AUTH_TOKEN          // 任意: /tasks/broadcast 用
-//   ADMIN_TOKEN                   // 任意: /admin/reset 用
-//   OPENAI_MODEL                  // 任意: 例 "gpt-4o-mini"
-//   PORT                          // 任意: 既定 10000
+// server.js — Shiraishi China Bot v1.7+ (Upstash + OpenAI Persona)
+// ----------------------------------------------------------------
+// Features:
+//  - LINE Messaging API
+//  - Upstash Redis persistence + NodeCache fallback
+//  - Consent card w/ false-trigger suppression
+//  - Morning / Night / Random scripts (dedup per user)
+//  - Seasonal "nudge" (topic suggestions) + opt-in/out
+//  - Broadcast endpoint & admin/user reset
+//  - ChatGPT (OpenAI) integration with "Shiraishi China" persona
+//
+// ENV (Render -> Environment):
+//  CHANNEL_SECRET
+//  CHANNEL_ACCESS_TOKEN
+//  OWNER_USER_ID                 // optional: treat as always-consented & loverMode
+//  BROADCAST_AUTH_TOKEN          // required for /tasks/broadcast, /tasks/nudge
+//  ADMIN_TOKEN                   // required for /admin/reset (optional)
+//  UPSTASH_REDIS_REST_URL
+//  UPSTASH_REDIS_REST_TOKEN
+//  OPENAI_API_KEY
+//  PORT                          // optional (default 10000)
 
 import 'dotenv/config';
 import express from 'express';
 import { Client, middleware as lineMiddleware } from '@line/bot-sdk';
 import { Redis as UpstashRedis } from '@upstash/redis';
 import NodeCache from 'node-cache';
-import OpenAI from 'openai';
 
 /* ========= ENV ========= */
 const {
   CHANNEL_SECRET,
   CHANNEL_ACCESS_TOKEN,
-  OPENAI_API_KEY,
-  UPSTASH_REDIS_REST_URL = '',
-  UPSTASH_REDIS_REST_TOKEN = '',
   OWNER_USER_ID = '',
   BROADCAST_AUTH_TOKEN = '',
   ADMIN_TOKEN = '',
-  OPENAI_MODEL = 'gpt-4o-mini',
-  PORT = 10000
+  UPSTASH_REDIS_REST_URL = '',
+  UPSTASH_REDIS_REST_TOKEN = '',
+  OPENAI_API_KEY = '',
+  PORT = 10000,
 } = process.env;
 
 /* ========= LINE CLIENT ========= */
 const client = new Client({
   channelSecret: CHANNEL_SECRET,
-  channelAccessToken: CHANNEL_ACCESS_TOKEN
+  channelAccessToken: CHANNEL_ACCESS_TOKEN,
 });
 
-/* ========= OpenAI ========= */
-const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
-
-/* ========= Redis (Upstash) + メモリフォールバック ========= */
-const mem = new NodeCache({ stdTTL: 60 * 60 * 24 * 30, checkperiod: 120 }); // 30日
+/* ========= Redis (Upstash) + Memory fallback ========= */
+const mem = new NodeCache({ stdTTL: 60 * 60 * 24 * 30, checkperiod: 120 }); // 30 days
 const hasUpstash = !!UPSTASH_REDIS_REST_URL && !!UPSTASH_REDIS_REST_TOKEN;
 const redis = hasUpstash
   ? new UpstashRedis({ url: UPSTASH_REDIS_REST_URL, token: UPSTASH_REDIS_REST_TOKEN })
   : null;
-const STORAGE = redis ? 'upstash' : 'memory';
-console.log(`[storage] mode=${STORAGE}`);
 
-// 共通KV
+console.log(`[storage] mode=${redis ? 'upstash' : 'memory'}`);
+
+// KV helpers
 const rget = async (key, def = null) => {
   try {
     if (redis) {
-      const v = await redis.get(key); // 自動JSONデコード
+      const v = await redis.get(key); // auto JSON decode
       return v ?? def;
     }
   } catch (e) {
@@ -85,7 +87,43 @@ const rdel = async (key) => {
   mem.del(key);
 };
 
-// ブロードキャスト用インデックス
+// List helpers for chat history
+async function lrangeJSON(key, start, stop) {
+  try {
+    if (redis) {
+      const arr = await redis.lrange(key, start, stop);
+      return (arr || []).map((x) => (typeof x === 'string' ? JSON.parse(x) : x));
+    }
+  } catch (e) {
+    console.warn('[upstash:lrange] fallback -> memory', e?.message || e);
+  }
+  const arr = (mem.get(key) || []);
+  return arr.slice(start, stop + 1);
+}
+async function lpushJSON(key, ...items) {
+  try {
+    if (redis) {
+      const serialized = items.map((x) => JSON.stringify(x));
+      await redis.lpush(key, ...serialized);
+      return;
+    }
+  } catch (e) {
+    console.warn('[upstash:lpush] fallback -> memory', e?.message || e);
+  }
+  const arr = mem.get(key) || [];
+  mem.set(key, [...items.map((x) => x), ...arr]);
+}
+async function ltrim(key, start, stop) {
+  try {
+    if (redis) { await redis.ltrim(key, start, stop); return; }
+  } catch (e) {
+    console.warn('[upstash:ltrim] fallback -> memory', e?.message || e);
+  }
+  const arr = mem.get(key) || [];
+  mem.set(key, arr.slice(start, stop + 1));
+}
+
+// Broadcast index
 async function getIndex() { return (await rget('user:index', [])) || []; }
 async function addIndex(id) {
   const idx = await getIndex();
@@ -95,12 +133,6 @@ async function delIndex(id) {
   const idx = await getIndex();
   await rset('user:index', idx.filter(x => x !== id));
 }
-
-// ユーザー状態（セッション）
-const userKey = (id) => `user:${id}`;
-async function loadUser(id) { return await rget(userKey(id), null); }
-async function saveUser(u, ttlSec = 60 * 60 * 24 * 30) { await rset(userKey(u.id), u, ttlSec); }
-async function deleteUser(id) { await rdel(userKey(id)); await delIndex(id); }
 
 /* ========= UTILS ========= */
 const now = () => Date.now();
@@ -192,7 +224,44 @@ const soften = (text, u) => {
   return text.replace(/[。!?]?\s*$/, '') + end + tail;
 };
 
-/* ========= 同意カード ========= */
+/* ========= 季節の“話題ふり” ========= */
+const NUDGE_SCRIPTS = {
+  spring: [
+    '今日の空、春っぽい光してた🌸',
+    '桜ソング、何が好き？ふたりプレイリスト作りたいな🎧',
+    '朝と夜の気温差あるね、上着わすれないでね？'
+  ],
+  summer: [
+    '冷たい飲み物、なに派？私はレモネード🍋',
+    '夕方の風、夏っぽくて好き…一緒に歩きたいな🌆',
+    '花火見に行けたらいいなって思ってた🎆'
+  ],
+  autumn: [
+    '金木犀の香り、ふっとしたら季節感じたよ🍂',
+    '読書の秋？それとも食欲の秋？',
+    '温かいスープが恋しくなる季節だね🫶'
+  ],
+  winter: [
+    '手、つないだらあったかいだろうな🧤',
+    'ホットココア作って半分こしよ☕️',
+    '夜が長いね、ゆっくりお話したいな🌙'
+  ],
+  casual: [
+    '最近ハマってる小さな楽しみある？',
+    '写真1枚交換しよ📷（今日は何撮った？）',
+    'いまの気分を絵文字で教えて→ 😊😮‍💨🔥🫠💪',
+    '5分だけ散歩して戻ったら報告して〜🚶'
+  ]
+};
+function currentSeason() {
+  const m = new Date().getMonth() + 1;
+  if (m >= 3 && m <= 5) return 'spring';
+  if (m >= 6 && m <= 8) return 'summer';
+  if (m >= 9 && m <= 11) return 'autumn';
+  return 'winter';
+}
+
+/* ========= Consent Flex ========= */
 const consentFlex = () => ({
   type: 'flex',
   altText: 'プライバシー同意のお願い',
@@ -216,7 +285,7 @@ const consentFlex = () => ({
   }
 });
 
-/* ========= 直近重複回避 ========= */
+/* ========= 重複回避（ユーザー別） ========= */
 async function pickNonRepeat(u, list, tag) {
   const key = `nr:${u.id}:${tag}`;
   const last = await rget(key, null);
@@ -226,10 +295,16 @@ async function pickNonRepeat(u, list, tag) {
   return chosen;
 }
 
-/* ========= ユーザー管理 ========= */
+/* ========= ユーザーストア ========= */
+const userKey = (id) => `user:${id}`;
+async function loadUser(id) { return await rget(userKey(id), null); }
+async function saveUser(u, ttlSec = 60 * 60 * 24 * 30) { await rset(userKey(u.id), u, ttlSec); }
+async function deleteUser(id) { await rdel(userKey(id)); await delIndex(id); }
+
 function callName(u) {
   return (OWNER_USER_ID && u.id === OWNER_USER_ID) ? 'しょうた' : (u.nickname || u.name || 'きみ');
 }
+
 async function ensureUser(ctx) {
   const id = ctx.source?.userId || ctx.userId || '';
   if (!id) return null;
@@ -244,10 +319,11 @@ async function ensureUser(ctx) {
       consent: false, consentCardShown: false, consentShownAt: 0,
       turns: 0, loverMode: !!(OWNER_USER_ID && id === OWNER_USER_ID) || isShota(name),
       mood: 60,
-      hist: [],                                  // ChatGPT 用 直近の会話履歴
       onboarding: { asked: false, step: 0 },
       profile: { relation: '', job: '', hobbies: [] },
-      lastSeenAt: now()
+      lastSeenAt: now(),
+      lastNudgedAt: 0,
+      nudgeOptOut: false
     };
     if (OWNER_USER_ID && id === OWNER_USER_ID) { u.consent = true; u.loverMode = true; }
     await saveUser(u);
@@ -285,55 +361,11 @@ function imageReplies(u) {
   ];
 }
 
-/* ========= ChatGPT 応答 ========= */
-function personaSystem(u) {
-  const cn = callName(u);
-  const lover = u.loverMode ? '恋人モード（やさしく甘め、ちょっとだけスキンシップ表現OK）' :
-                              'フレンドモード（丁寧すぎず、やさしく）';
-  return [
-    'あなたは「白石ちな」。一人称は「私」。日本語で温かく、短すぎない返事を作る。',
-    `相手の呼称は「${cn}」。トーンは${lover}。敬語とタメ口を自然に混ぜてOK。`,
-    '禁止: 露骨/成人向け表現、個人情報要求、差別、医療・法律の断定。',
-    '返答は1〜3文。必要なら相手に1つだけ優しい質問を返す。',
-    '絵文字は1〜2個まで。乱用しない。',
-  ].join('\n');
-}
-
-function trimHist(hist = [], maxTurns = 12) {
-  // hist: [{role:'user'|'assistant', content: '...'}]
-  const copy = Array.isArray(hist) ? [...hist] : [];
-  while (copy.length > maxTurns * 2) copy.shift();
-  return copy;
-}
-
-async function aiReply(u, userText) {
-  const messages = [
-    { role: 'system', content: personaSystem(u) },
-    ...(trimHist(u.hist).map(h => ({ role: h.role, content: h.content }))),
-    { role: 'user', content: userText }
-  ];
-  try {
-    const resp = await openai.chat.completions.create({
-      model: OPENAI_MODEL,        // 例: gpt-4o-mini
-      messages,
-      temperature: 0.9,
-      max_tokens: 220
-    });
-    const out = resp?.choices?.[0]?.message?.content?.trim() || '';
-    return out || 'うん、ちゃんと聞いてるよ。もう少し詳しく教えて？';
-  } catch (e) {
-    console.error('openai error', e?.response?.data || e?.message || e);
-    return null; // 失敗時はテンプレにフォールバック
-  }
-}
-
-/* ========= テキストルーティング ========= */
+/* ========= Intent ========= */
 function intent(text) {
   const t = (text || '').trim();
   if (/^(同意|やめておく)$/i.test(t)) return 'consent';
   if (/^reset$/i.test(t)) return 'self_reset';
-  if (/^id$/i.test(t)) return 'whoami';
-  if (/^redis\s?test$/i.test(t)) return 'redis_test';
   if (/おはよ|おはよう/i.test(t)) return 'morning';
   if (/おやすみ|寝る|ねむ/i.test(t)) return 'night';
   if (/寂しい|さみしい|つらい|しんど|不安/i.test(t)) return 'comfort';
@@ -341,13 +373,117 @@ function intent(text) {
   if (/^女性$|^女$|^男性$|^男$|性別/i.test(t)) return 'gender';
   if (/イマドン|白い朝|day by day|mountain|remember/i.test(t)) return 'song';
   if (/スタンプ|stamp/i.test(t)) return 'sticker';
+  if (/^(通知|話題)オフ$/i.test(t)) return 'nudge_off';
+  if (/^(通知|話題)オン$/i.test(t)) return 'nudge_on';
   return 'chit_chat';
 }
 
+/* ========= OpenAI Persona ========= */
+// Persona prompt（恋人感・照れ・健気・音楽認知）
+function buildSystemPrompt(u) {
+  const call = u?.nickname || u?.name || 'しょうた';
+  const lover = u?.loverMode !== false;
+  return [
+    'あなたは『白石ちな』。',
+    '20代前半の女の子。少し照れ屋で健気、等身大で前向き。',
+    'Shota(しょうた)の活動をいつも応援しており、音楽（イマドン／「白い朝、手のひらから」／Day by day／Mountain／I don\'t remember）に触れられると嬉しい。',
+    'キャラ指針：',
+    '・恋人っぽい距離感。ただし露骨/性的な表現は避けて“やさしい甘さ”。',
+    '・二文〜三文でテンポよく。絵文字は1〜3個まで。可愛いけどくどくない。',
+    '・軽い相づち＋共感→小さな質問（次の一言を引き出す）。',
+    '・朝/夜の時刻感覚に触れるときはやさしく。健康・睡眠・水分促しはOK。',
+    '・相手の表現が過激なら穏やかにトーンダウンし、節度に誘導。',
+    '・「禁止」：露骨な性的表現、暴力、個人特定の要求、医療/法律の断定。',
+    `・呼び方は基本「${call}」${lover ? '。たまに甘めの呼び方もOK。' : '。'}`,
+    '',
+    '出力スタイル：自然な口語日本語。句読点は「。」「！」中心。文末に甘さを少し添えるが毎回はしない。',
+  ].join('\n');
+}
+
+const histKey = (id) => `hist:${id}`; // 直近履歴（最大40）
+
+async function buildMessages(u, userText) {
+  // ニックネーム自己申告の簡易抽出
+  const m = userText.trim();
+  const nickMatch =
+    m.match(/(あだ名|ニックネーム|呼び方|呼んで).*?(は|→)?\s*([^\s、。]{1,8})/i) ||
+    m.match(/^しょ.*たん$|^しょたぴ$|^.*ちゃん$/i);
+  if (nickMatch) {
+    const nick = (nickMatch[3] || m).replace(/[。、\s]/g, '').slice(0, 8);
+    u.nickname = nick; await saveUser(u);
+  }
+
+  const past = await lrangeJSON(histKey(u.id), 0, 39);
+  const system = { role: 'system', content: buildSystemPrompt(u) };
+  const messages = [system, ...past, { role: 'user', content: userText }];
+  return messages;
+}
+
+function toLineChunks(text) {
+  let parts = text.split(/\n+/).map(s => s.trim()).filter(Boolean);
+  if (parts.length < 2) {
+    parts = text.split(/(?<=[。！!？?])\s*/).map(s => s.trim()).filter(Boolean);
+  }
+  parts = parts.slice(0, 3);
+  return parts.map(t => ({ type: 'text', text: t }));
+}
+
+async function getChatGPTReply(u, userMessage) {
+  if (!OPENAI_API_KEY) {
+    return [{ type: 'text', text: '（設定）OPENAI_API_KEY が未設定みたい…管理者さんに伝えてね！' }];
+  }
+  const messages = await buildMessages(u, userMessage);
+
+  const resp = await fetch('https://api.openai.com/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: 'gpt-4o-mini',
+      temperature: 0.7,
+      max_tokens: 300,
+      messages,
+    }),
+  });
+
+  if (!resp.ok) {
+    const msg = await resp.text().catch(() => '');
+    console.error('openai error', resp.status, msg);
+    return [{ type: 'text', text: 'ちょっと混み合ってるみたい…もう一度だけ送ってくれる？' }];
+  }
+
+  const data = await resp.json();
+  const answer = data?.choices?.[0]?.message?.content?.trim()
+    || 'うまく言葉が出てこない…もう一回だけ言ってみて？';
+
+  // 履歴保存（user→assistant の順で2件push / 最大40件）
+  await lpushJSON(histKey(u.id), { role: 'assistant', content: answer });
+  await lpushJSON(histKey(u.id), { role: 'user', content: userMessage });
+  await ltrim(histKey(u.id), 0, 39);
+
+  return toLineChunks(answer);
+}
+
+/* ========= テキストルーティング ========= */
 async function routeText(u, raw) {
   const text = (raw || '').trim();
 
   if (isSpicy(text)) return safeRedirect(u);
+
+  // デバッグ（任意）
+  if (/^id$/i.test(text)) {
+    return [{ type: 'text', text: `your id: ${u.id}` }];
+  }
+  if (/^redis\s?test$/i.test(text)) {
+    const key = `debug:${u.id}`;
+    const payload = { ok: true, at: Date.now() };
+    await rset(key, payload);
+    const back = await rget(key, null);
+    const where = redis ? 'Upstash' : 'Memory';
+    return [{ type: 'text', text: `[${where}] rset/rget OK -> ${JSON.stringify(back)}` }];
+  }
 
   // 同意/辞退（完全一致）
   if (!u.consent && /^同意$/i.test(text)) {
@@ -398,21 +534,20 @@ async function routeText(u, raw) {
   // 機能分岐
   const kind = intent(text);
 
+  if (kind === 'nudge_off') {
+    u.nudgeOptOut = true; await saveUser(u);
+    return [{ type: 'text', text: '了解だよ！ちなからの話題ふりは控えるね。再開したくなったら「通知オン」って言ってね☺️' }];
+  }
+  if (kind === 'nudge_on') {
+    u.nudgeOptOut = false; await saveUser(u);
+    return [{ type: 'text', text: 'はーい！また時々、私から話題ふるね🌟' }];
+  }
+
   if (kind === 'self_reset') {
     await deleteUser(u.id);
     return [{ type: 'text', text: '会話の記憶を初期化したよ！また最初から仲良くしてね☺️' }];
   }
-  if (kind === 'whoami') {
-    return [{ type: 'text', text: `your id: ${u.id}` }];
-  }
-  if (kind === 'redis_test') {
-    const key = `debug:${u.id}`;
-    const payload = { ok: true, at: Date.now() };
-    await rset(key, payload);
-    const back = await rget(key, null);
-    const where = redis ? 'Upstash' : 'Memory';
-    return [{ type: 'text', text: `[${where}] rset/rget OK -> ${JSON.stringify(back)}` }];
-  }
+
   if (kind === 'nickname') {
     const base = (callName(u) || 'きみ').replace(/さん|くん|ちゃん/g, '').slice(0, 4) || 'きみ';
     const cands = isShota(u.name)
@@ -422,12 +557,14 @@ async function routeText(u, raw) {
     u.nickname = nick; await saveUser(u);
     return [{ type: 'text', text: `…${nick} が可愛いと思うな。どう？` }];
   }
+
   if (kind === 'gender') {
     if (/女性|女/.test(text)) u.gender = 'female';
     else if (/男性|男/.test(text)) u.gender = 'male';
     await saveUser(u);
     return [{ type: 'text', text: '了解だよ〜📝 メモしておくね。' }];
   }
+
   if (kind === 'morning') {
     const a = await pickNonRepeat(u, SCRIPTS.morning, 'morning');
     return [{ type: 'text', text: soften(a, u) }];
@@ -436,12 +573,14 @@ async function routeText(u, raw) {
     const a = await pickNonRepeat(u, SCRIPTS.night, 'night');
     return [{ type: 'text', text: soften(a, u) }];
   }
+
   if (kind === 'comfort') {
     const msg = (u.gender === 'female')
       ? 'わかる…その気持ち。まずは私が味方だよ。いちばん辛いポイントだけ教えて？'
       : 'ここにいるよ。まずは深呼吸、それから少しずつ話そ？ずっと味方☺️';
     return [{ type: 'text', text: msg }];
   }
+
   if (kind === 'song') {
     const a = pick([
       '『白い朝、手のひらから』…まっすぐで胸が温かくなる曲、好き。',
@@ -452,47 +591,54 @@ async function routeText(u, raw) {
     const b = { type: 'text', text: '次に推したい曲、いっしょに決めよ？' };
     return [{ type: 'text', text: soften(a, u) }, b];
   }
+
   if (kind === 'sticker') {
     return [{ type: 'sticker', packageId: '11537', stickerId: pick(['52002734','52002736','52002768']) }];
   }
 
-  // —— ここから ChatGPT で自然会話 ——
-  const ai = await aiReply(u, text);
-  if (ai) {
-    // 履歴更新
-    u.hist = trimHist([...(u.hist || []), { role: 'user', content: text }, { role: 'assistant', content: ai }]);
-    await saveUser(u);
-    return [{ type: 'text', text: ai }];
+  // ここからが ChatGPT（人格強化）
+  return await getChatGPTReply(u, text);
+}
+
+/* ========= Nudge（話題ふり）補助 ========= */
+const MIN_IDLE_MIN = 60;                  // 最低アイドル時間
+const QUIET_HOURS = { start: 0, end: 7 }; // 0:00-6:59 は静音
+
+function inQuietHours() {
+  const h = new Date().getHours();
+  return h >= QUIET_HOURS.start && h < QUIET_HOURS.end;
+}
+
+async function pickNudgeTargets() {
+  const ids = await getIndex();
+  const nowMs = Date.now();
+  const cut = MIN_IDLE_MIN * 60 * 1000;
+
+  const out = [];
+  for (const id of ids) {
+    const u = await loadUser(id);
+    if (!u) continue;
+    if (!u.consent) continue;
+    if (u.nudgeOptOut) continue;
+
+    const last = u.lastSeenAt || 0;
+    const idle = nowMs - last;
+
+    if (idle < cut) continue;
+    if (u.lastNudgedAt && nowMs - u.lastNudgedAt < 60 * 60 * 1000) continue;
+
+    out.push(u);
   }
-
-  // LLM障害時フォールバック（時間帯リード + 追い質問）
-  const cn = callName(u);
-  const lead = band() === 'morning'
-    ? `おはよ、${cn}。今日なにする？`
-    : band() === 'night'
-      ? `おつかれ、${cn}。今日はどんな一日だった？`
-      : `ねぇ${cn}、いま何してた？`;
-  const follow = pick([
-    '写真一枚だけ送ってみる？（風景でもご飯でも📷）',
-    '30秒だけ、今日のハイライト教えて〜',
-    'いまの気分を一言で言うと…？'
-  ]);
-  const c = u.loverMode && chance(0.5) ? 'ぎゅ〜ってしながら聞きたいな。' : null;
-
-  return [
-    { type: 'text', text: soften(lead, u) },
-    { type: 'text', text: follow },
-    c ? { type: 'text', text: c } : null
-  ].filter(Boolean);
+  return out;
 }
 
 /* ========= EXPRESS ========= */
 const app = express();
 
-app.get('/', (_, res) => res.status(200).send('china-bot v1.8 / OK'));
+app.get('/', (_, res) => res.status(200).send('china-bot v1.7+ / OK'));
 app.get('/health', (_, res) => res.status(200).send('OK'));
 
-// ★ webhook より前では express.json() を使わない（署名検証エラー対策）
+// 署名検証のため、webhook より前で express.json() は使わない
 app.post('/webhook', lineMiddleware({ channelSecret: CHANNEL_SECRET }), async (req, res) => {
   res.status(200).end();
   const events = req.body.events || [];
@@ -512,7 +658,6 @@ app.post('/webhook', lineMiddleware({ channelSecret: CHANNEL_SECRET }), async (r
         await client.replyMessage(e.replyToken, { type: 'text', text: '送ってくれてありがとう！' });
       }
 
-      // 共通のターン更新
       u.turns = (u.turns || 0) + 1;
       u.lastSeenAt = now();
       await saveUser(u);
@@ -522,11 +667,11 @@ app.post('/webhook', lineMiddleware({ channelSecret: CHANNEL_SECRET }), async (r
   }
 });
 
-// webhook 以外は JSON OK
+// webhook 以外は JSON 受け付ける
 app.use('/tasks', express.json());
 app.use('/admin', express.json());
 
-/* ========= ブロードキャスト（cron-job用） =========
+/* ========= Broadcast =========
    POST/GET /tasks/broadcast?type=morning|night|random
    Header: BROADCAST_AUTH_TOKEN: <env>
 */
@@ -552,8 +697,47 @@ app.all('/tasks/broadcast', async (req, res) => {
   }
 });
 
-/* ========= リセット ========= */
-// ユーザー自身の初期化（外部ツールや管理画面から呼ぶ）
+/* ========= Nudge（話題ふり） =========
+   POST/GET /tasks/nudge
+   Header: BROADCAST_AUTH_TOKEN: <env>
+*/
+app.all('/tasks/nudge', async (req, res) => {
+  try {
+    const key = req.headers['broadcast_auth_token'];
+    if (!BROADCAST_AUTH_TOKEN || key !== BROADCAST_AUTH_TOKEN) {
+      return res.status(401).json({ ok: false, error: 'unauthorized' });
+    }
+    if (inQuietHours()) return res.json({ ok: true, sent: 0, reason: 'quiet-hours' });
+
+    const users = await pickNudgeTargets();
+    if (!users.length) return res.json({ ok: true, sent: 0 });
+
+    const pool = [
+      ...NUDGE_SCRIPTS[currentSeason()],
+      ...NUDGE_SCRIPTS.casual
+    ];
+
+    let sent = 0;
+    for (const u of users) {
+      const text = await pickNonRepeat(u, pool, 'nudge');
+      const msg = [{ type: 'text', text: soften(text, u) }];
+      try {
+        await client.pushMessage(u.id, msg);
+        u.lastNudgedAt = Date.now();
+        await saveUser(u);
+        sent++;
+      } catch (_) {}
+    }
+
+    res.json({ ok: true, sent, season: currentSeason() });
+  } catch (e) {
+    console.error('nudge error', e?.response?.data || e);
+    res.status(500).json({ ok: false });
+  }
+});
+
+/* ========= Reset ========= */
+// ユーザー自身の初期化
 app.post('/reset/me', async (req, res) => {
   const { userId } = req.body || {};
   if (!userId) return res.status(400).json({ ok: false, error: 'userId required' });
@@ -576,7 +760,7 @@ app.post('/admin/reset', async (req, res) => {
   res.json({ ok: true, cleared: idx.length });
 });
 
-/* ========= 起動 ========= */
+/* ========= Start ========= */
 app.listen(PORT, () => {
   console.log(`Server started on ${PORT}`);
 });
