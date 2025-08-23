@@ -1,4 +1,3 @@
-
 // server.js — Shiraishi China Bot v2.2 (LINE + Upstash + OpenAI + Stripe Plans)
 // -----------------------------------------------------------------------------
 // Requires: express, dotenv, @line/bot-sdk, @upstash/redis, node-cache, stripe, openai
