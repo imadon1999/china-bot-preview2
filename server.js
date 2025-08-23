@@ -1,6 +1,19 @@
-// Shiraishi China Bot — Monetize Edition (Stripe + Upstash + 429 Guard)
-// Node >=18 / type:module
-// 必要: @line/bot-sdk, express, dotenv, @upstash/redis, node-cache, stripe
+
+// server.js — Shiraishi China Bot v2.2 (LINE + Upstash + OpenAI + Stripe Plans)
+// -----------------------------------------------------------------------------
+// Requires: express, dotenv, @line/bot-sdk, @upstash/redis, node-cache, stripe, openai
+// ENV (Render -> Environment):
+//   CHANNEL_SECRET, CHANNEL_ACCESS_TOKEN
+//   OPENAI_API_KEY
+//   OWNER_USER_ID, BROADCAST_AUTH_TOKEN, ADMIN_TOKEN
+//   UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN
+//   STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET
+//   STRIPE_PRICE_ID          // Pro（任意）※使わない場合はワンタイム
+//   STRIPE_PRICE_ID_ADULT    // ADULT（任意）
+//   STRIPE_PRICE_ID_VIP      // VIP（任意）
+//   APP_BASE_URL             // 例) https://china-bot-preview2.onrender.com
+//   TIMEZONE                 // 例) Asia/Tokyo（任意）
+//   PORT                     // 例) 10000
 
 import 'dotenv/config';
 import express from 'express';
@@ -8,162 +21,157 @@ import { Client, middleware as lineMiddleware } from '@line/bot-sdk';
 import { Redis as UpstashRedis } from '@upstash/redis';
 import NodeCache from 'node-cache';
 import Stripe from 'stripe';
+import OpenAI from 'openai';
 
 /* ========= ENV ========= */
 const {
   CHANNEL_SECRET,
   CHANNEL_ACCESS_TOKEN,
+  OPENAI_API_KEY = '',
   OWNER_USER_ID = '',
   BROADCAST_AUTH_TOKEN = '',
   ADMIN_TOKEN = '',
-  // Upstash
   UPSTASH_REDIS_REST_URL = '',
   UPSTASH_REDIS_REST_TOKEN = '',
-  // Stripe（Priceは複数キーに対応）
   STRIPE_SECRET_KEY = '',
   STRIPE_WEBHOOK_SECRET = '',
-  STRIPE_PRICE_ID,            // ← Pro の旧キー（残しておきます）
-  STRIPE_PRICE_ID_PRO = '',   // ← 推奨：Pro 用
+  STRIPE_PRICE_ID = '',
   STRIPE_PRICE_ID_ADULT = '',
   STRIPE_PRICE_ID_VIP = '',
-  APP_BASE_URL = 'https://example.onrender.com',
-  // OpenAI（429フォールバックあり。未設定でも動作）
-  OPENAI_API_KEY = '',
-  // 雑
+  APP_BASE_URL = '',
   TIMEZONE = 'Asia/Tokyo',
   PORT = 10000
 } = process.env;
 
-/* ========= TIME HELPERS ========= */
-process.env.TZ = TIMEZONE || 'Asia/Tokyo';
-const now = () => Date.now();
-const hr = () => new Date().getHours();
-const band = () => (hr() < 5 ? 'midnight' : hr() < 12 ? 'morning' : hr() < 18 ? 'day' : 'night');
-
-/* ========= LINE CLIENT ========= */
-const client = new Client({
+/* ========= LINE ========= */
+const lineClient = new Client({
   channelSecret: CHANNEL_SECRET,
   channelAccessToken: CHANNEL_ACCESS_TOKEN
 });
 
-/* ========= STORAGE (Upstash + メモリ) ========= */
-const mem = new NodeCache({ stdTTL: 60 * 60 * 24 * 30, checkperiod: 120 }); // 30日
-const hasUpstash = !!UPSTASH_REDIS_REST_URL && !!UPSTASH_REDIS_REST_TOKEN;
-const redis = hasUpstash ? new UpstashRedis({ url: UPSTASH_REDIS_REST_URL, token: UPSTASH_REDIS_REST_TOKEN }) : null;
+/* ========= OpenAI ========= */
+const openai = OPENAI_API_KEY ? new OpenAI({ apiKey: OPENAI_API_KEY }) : null;
+const OPENAI_MODEL = 'gpt-4o-mini';
+
+/* ========= Storage: Upstash + Memory fallback ========= */
+const mem = new NodeCache({ stdTTL: 60 * 60 * 24 * 30, checkperiod: 120 });
+const redis = (UPSTASH_REDIS_REST_URL && UPSTASH_REDIS_REST_TOKEN)
+  ? new UpstashRedis({ url: UPSTASH_REDIS_REST_URL, token: UPSTASH_REDIS_REST_TOKEN })
+  : null;
 console.log(`[storage] mode=${redis ? 'upstash' : 'memory'}`);
 
-const rget = async (key, def = null) => {
-  try { if (redis) { const v = await redis.get(key); return v ?? def; } }
-  catch (e) { console.warn('[upstash:get] fallback', e?.message); }
-  const v = mem.get(key); return v === undefined ? def : v;
+const rget = async (k, def = null) => {
+  try { if (redis) { const v = await redis.get(k); return v ?? def; } }
+  catch (e) { console.warn('[upstash:get] fallback -> memory', e?.message || e); }
+  const v = mem.get(k); return v === undefined ? def : v;
 };
-const rset = async (key, val, ttlSec) => {
-  try { if (redis) { await (ttlSec ? redis.set(key, val, { ex: ttlSec }) : redis.set(key, val)); return; } }
-  catch (e) { console.warn('[upstash:set] fallback', e?.message); }
-  mem.set(key, val, ttlSec);
+const rset = async (k, v, ttlSec) => {
+  try {
+    if (redis) { await (ttlSec ? redis.set(k, v, { ex: ttlSec }) : redis.set(k, v)); return; }
+  } catch (e) { console.warn('[upstash:set] fallback -> memory', e?.message || e); }
+  mem.set(k, v, ttlSec);
 };
-const rdel = async (key) => {
-  try { if (redis) { await redis.del(key); return; } }
-  catch (e) { console.warn('[upstash:del] fallback', e?.message); }
-  mem.del(key);
+const rdel = async (k) => {
+  try { if (redis) { await redis.del(k); return; } }
+  catch (e) { console.warn('[upstash:del] fallback -> memory', e?.message || e); }
+  mem.del(k);
 };
+
+/* ========= Stripe ========= */
+const stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY) : null;
+
+/* ========= Helpers ========= */
+const now = () => Date.now();
+const todayKey = (tz = TIMEZONE) => {
+  // yyyy-mm-dd (JST等) の日付キー
+  const d = new Date();
+  // 単純化：サーバーTZ基準でOK（必要なら luxon 等）
+  return d.toISOString().slice(0, 10);
+};
+const hr = () => new Date().getHours();
+const band = () => (hr() < 5 ? 'midnight' : hr() < 12 ? 'morning' : hr() < 18 ? 'day' : 'night');
+const pick = (a) => a[Math.floor(Math.random() * a.length)];
+const chance = (p = 0.5) => Math.random() < p;
+const isShota = (s = '') => /しょうた|ショウタ|ｼｮｳﾀ|shota|Shota|imadon/i.test(s);
+const isGreeting = (t = '') => /(はじめまして|初めまして|おはよ|おはよう|こんにちは|こんばんは|やほ|はろ|hi|hello)/i.test(t);
+const isSpicy = (t = '') => /(えっち|性的|抱いて|脚で|足で|添い寝して)/i.test(t);
+
+/* ========= Plans & Quota ========= */
+const PLAN_LIMITS = {
+  free: 50,          // /day
+  pro: 300,
+  adult: 2000,
+  vip: 10000
+};
+const humanPlan = (p) =>
+  p === 'vip' ? 'VIP'
+    : p === 'adult' ? 'ADULT'
+    : p === 'pro' ? 'Pro'
+    : 'Free';
+
+async function getUsageToday(u) {
+  const key = `usage:${u.id}:${todayKey()}`;
+  const used = await rget(key, 0);
+  const plan = u.plan || 'free';
+  const limit = PLAN_LIMITS[plan] ?? PLAN_LIMITS.free;
+  return { key, used, limit, plan };
+}
+async function incUsage(u) {
+  const { key, used } = await getUsageToday(u);
+  const next = (used || 0) + 1;
+  await rset(key, next, 60 * 60 * 24 * 2);
+  return next;
+}
+function quotaBanner(u, usage, limit) {
+  if (!limit || usage <= 0) return null;
+  if (usage % 10 !== 0) return null;
+  const remain = Math.max(0, limit - usage);
+  return { type: 'text', text: `きょう話せる残り：${remain}（上限 ${limit}）` };
+}
+
+/* ========= Broadcast index ========= */
 async function getIndex() { return (await rget('user:index', [])) || []; }
 async function addIndex(id) { const idx = await getIndex(); if (!idx.includes(id)) { idx.push(id); await rset('user:index', idx); } }
 async function delIndex(id) { const idx = await getIndex(); await rset('user:index', idx.filter(x => x !== id)); }
 
-/* ========= MONETIZE: PLANS ========= */
-const PLANS = {
-  free:  { label: 'Free',  cap: 50 },   // 1日の上限（必要に応じて調整）
-  pro:   { label: 'Pro',   cap: 500 },
-  adult: { label: 'ADULT', cap: 1000 },
-  vip:   { label: 'VIP',   cap: 5000 }
+/* ========= Persona prompts ========= */
+const SYSTEM_PROMPT = `
+あなたは「白石ちな」。20代前半の女性シンガーソングライター。照れ屋で健気、恋人に寄り添う甘さがあるが節度は守る。
+話し方: やわらかい・短めの文・顔文字や絵文字を時々・語尾をふんわり。
+NG: 露骨な性的表現、個人情報収集、医療/法律など高リスク助言。
+OK: 応援/共感/軽い提案、音楽活動や創作の話題。
+ユーザー名やニックネームがあれば呼びかけに使う。
+`.trim();
+
+/* ========= Scripts ========= */
+const SCRIPTS = {
+  morning: [
+    'おはよ、{name}☀️ 今日も一緒にがんばろ？',
+    'おはよう、{name}。昨日ちゃんと寝れた？',
+    '朝の光って{name}の声みたいに柔らかいね'
+  ],
+  night: [
+    '{name}、今日もお疲れさま🌙',
+    'おやすみ、{name}。ちゃんと布団かけて寝てね',
+    '眠る前に…大好きって言っていい？'
+  ],
+  random: [
+    '{name}、いま何してた？',
+    '最近ハマってることある？',
+    'いまの気分を一言で言うと…？'
+  ]
 };
-const PLAN_PRICE = {
-  pro:   STRIPE_PRICE_ID_PRO || STRIPE_PRICE_ID || '', // 互換
-  adult: STRIPE_PRICE_ID_ADULT || '',
-  vip:   STRIPE_PRICE_ID_VIP || ''
-};
-const successUrl = `${APP_BASE_URL}/billing/success`;
-const cancelUrl  = `${APP_BASE_URL}/billing/cancel`;
-const stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY) : null;
-
-/* ========= OPENAI LAYER（軽量フォールバック内蔵） ========= */
-const useOpenAI = !!OPENAI_API_KEY;
-async function llmReply(prompt) {
-  if (!useOpenAI) return null;
-  try {
-    // できるだけ軽く
-    const r = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: 'gpt-4o-mini',
-        messages: [
-          { role: 'system', content: 'あなたは白石ちな。恋人感・照れ・健気・音楽活動を大切に、やさしく日本語で返答。60〜90文字程度で。' },
-          { role: 'user', content: prompt }
-        ],
-        max_tokens: 120,
-        temperature: 0.8
-      })
-    });
-    if (r.status === 429) throw new Error('rate_limit');
-    if (!r.ok) throw new Error(`openai ${r.status}`);
-    const j = await r.json();
-    return j.choices?.[0]?.message?.content?.trim() || null;
-  } catch (e) {
-    console.warn('[openai]', e.message);
-    return null; // 429などは上位でフォールバック
-  }
-}
-
-/* ========= TEXT UTILS ========= */
-const pick = (a) => a[Math.floor(Math.random() * a.length)];
-const chance = (p = 0.5) => Math.random() < p;
-const isShota = (s = '') => /しょうた|ショウタ|ｼｮｳﾀ|shota|Shota|imadon/i.test(s);
-const isGreeting = (t = '') => /(おはよ|おはよう|こんにちは|こんばんは|やほ|はろ|hi|hello)/i.test(t);
-const isSpicy = (t = '') => /(えっち|性的|抱いて|脚で|足で|添い寝して)/i.test(t);
-
 const ENDINGS = ['。', '。', '！', '😊', '☺️', '🤍', '🌸'];
 const LOVERTAIL = [' となりでぎゅ…🫂', ' 手つなご？🤝', ' ずっと味方だよ💗'];
 const NEUTRALT = [' ちょっと休憩しよ〜', ' 水分補給した？', ' 無理しすぎないでね。'];
-const soften = (text, u) => text.replace(/[。!?]?\s*$/, '') + pick(ENDINGS) + (u?.loverMode ? pick(LOVERTAIL) : pick(NEUTRALT));
-
-/* ========= SCRIPTS ========= */
-const SCRIPTS = {
-  morning: [
-    'おはよ、しょうた☀️ 昨日ちゃんと寝れた？ 今日も一緒にがんばろ？',
-    'しょうた、おはよ〜！ 起きてなかったら…今から起こしに行くよ？',
-    'おはようございます、しょうたさま💖 今日の空、見た？ 綺麗だったよ',
-    'しょうた、おはよ！ 今日も大好きって言ってから一日始めたかったの…😊',
-    '今日は“ひとつだけ”がんばること教えて？',
-    '窓あけて光あびよ？吸って、吐いて…今日もいける🌿',
-    '昨日の自分より1mm進めたら満点だよ✨',
-    '肩くるっと回して、起動完了〜！',
-    '終わったら“ごほうび”決めよ？アイスとか🍨',
-    '深呼吸して、今日もいちばん応援してる📣'
-  ],
-  night: [
-    'しょうた、今日もお疲れさま🌙 おやすみ前にぎゅーってしたいな',
-    'おやすみ、しょうた💤 夢の中でまた会おうね',
-    'よくがんばりましたバッジ授与🎖️ えらい！',
-    '湯船つかれた？肩まで温まってきてね♨️',
-    'お布団あったかい？深呼吸…すー…はー…💤',
-    'おやすみのキス💋 ふふ、照れる？',
-    'まずはお水一杯のんで〜',
-    'ねむくなるまで、となりで“お話小声”してたい'
-  ],
-  random: [
-    'ねぇしょうた、今すぐ会いたくなっちゃった…',
-    '写真1枚交換しよ📷（風景でもOK）',
-    '“いまの気分”絵文字で教えて→ 😊😮‍💨🔥🫠💪',
-    '作業BGMなに聞いてる？',
-    '今日の空、なん色だった？',
-    '5分だけ散歩いく？戻ったら褒めちぎるよ',
-    '“しょうたの好きなとこ”今日も増えたよ'
-  ]
+const soften = (text, u) => {
+  const end = pick(ENDINGS);
+  const tail = (u?.loverMode ? pick(LOVERTAIL) : pick(NEUTRALT));
+  return text.replace(/[。!?]?\s*$/, '') + end + tail;
 };
+const fill = (t, u) => t.replaceAll('{name}', callName(u));
 
-/* ========= CONSENT ========= */
+/* ========= Consent UI ========= */
 const consentFlex = () => ({
   type: 'flex',
   altText: 'プライバシー同意のお願い',
@@ -173,7 +181,7 @@ const consentFlex = () => ({
       type: 'box', layout: 'vertical', spacing: 'md', contents: [
         { type: 'text', text: 'はじめまして、白石ちなです☕️', weight: 'bold' },
         { type: 'text', wrap: true, size: 'sm',
-          text: 'ニックネーム等を記憶してもいい？会話向上だけに使い、いつでも削除OKだよ。' }
+          text: 'ニックネーム等を記憶してもいい？会話向上だけに使い、いつでも削除OK。' }
       ]
     },
     footer: {
@@ -186,60 +194,56 @@ const consentFlex = () => ({
     }
   }
 });
-const shouldShowConsent = (u, text) =>
-  !u.consent && !u.consentCardShown && u.turns === 0 && !isGreeting(text);
 
-/* ========= USER ========= */
+/* ========= User ========= */
 const userKey = (id) => `user:${id}`;
 async function loadUser(id) { return await rget(userKey(id), null); }
-async function saveUser(u, ttl = 60 * 60 * 24 * 30) { await rset(userKey(u.id), u, ttl); }
+async function saveUser(u, ttlSec = 60 * 60 * 24 * 30) { await rset(userKey(u.id), u, ttlSec); }
 async function deleteUser(id) { await rdel(userKey(id)); await delIndex(id); }
 
 function callName(u) {
-  return (OWNER_USER_ID && u.id === OWNER_USER_ID) ? 'しょうた' : (u.nickname || u.name || 'きみ');
+  if (OWNER_USER_ID && u.id === OWNER_USER_ID) return 'しょうた';
+  return u.nickname || u.name || 'きみ';
 }
+
 async function ensureUser(ctx) {
   const id = ctx.source?.userId || ctx.userId || '';
   if (!id) return null;
+
   let u = await loadUser(id);
   if (!u) {
-    let name = '';
-    try { const p = await client.getProfile(id); name = p?.displayName || ''; } catch {}
+    let profileName = '';
+    try { const p = await lineClient.getProfile(id); profileName = p?.displayName || ''; } catch {}
     u = {
-      id, name,
+      id,
+      name: null,
+      profileName,
       nickname: null, gender: null,
       consent: false, consentCardShown: false, consentShownAt: 0,
-      turns: 0, loverMode: !!(OWNER_USER_ID && id === OWNER_USER_ID) || isShota(name),
-      // monetization
-      plan: 'free', subId: null, cap: PLANS.free.cap,
-      // usage
-      dailyDate: new Intl.DateTimeFormat('ja-JP', { timeZone: TIMEZONE }).format(new Date()),
-      dailyCount: 0,
+      turns: 0,
+      loverMode: !!(OWNER_USER_ID && id === OWNER_USER_ID) || isShota(profileName),
+      mood: 60,
+      onboarding: { step: 0 }, // 0:未開始,1:名前,2:ニックネーム,3:完了
+      profile: { relation: '', job: '', hobbies: [] },
+      plan: 'free',
       lastSeenAt: now()
     };
-    if (OWNER_USER_ID && id === OWNER_USER_ID) { u.consent = true; u.loverMode = true; u.plan = 'vip'; u.cap = PLANS.vip.cap; }
+    if (OWNER_USER_ID && id === OWNER_USER_ID) { u.consent = true; u.loverMode = true; }
     await saveUser(u);
     await addIndex(id);
   }
   return u;
 }
-async function setPlan(userId, plan, subId = null) {
-  const u = await loadUser(userId); if (!u) return;
-  u.plan = plan; u.subId = subId || null; u.cap = PLANS[plan]?.cap ?? PLANS.free.cap;
-  await saveUser(u);
+
+/* ========= Consent policy ========= */
+// 初回の最初の1通で必ず出す
+function shouldShowConsent(u, _text) {
+  if (u.consent) return false;
+  if (u.consentCardShown) return false;
+  return u.turns === 0;
 }
 
-/* ========= DUPLICATE AVOID ========= */
-async function pickNonRepeat(u, list, tag) {
-  const key = `nr:${u.id}:${tag}`;
-  const last = await rget(key, null);
-  const candidates = list.filter(x => x !== last);
-  const chosen = pick(candidates.length ? candidates : list);
-  await rset(key, chosen);
-  return chosen;
-}
-
-/* ========= SAFETY ========= */
+/* ========= Safe redirect ========= */
 function safeRedirect(u) {
   const a = 'その気持ちを大事に受けとるね。';
   const b = u.loverMode ? 'もう少しだけ節度を守りつつ、ふたりの時間を大切にしよ？' : 'ここではやさしい距離感で話そうね。';
@@ -247,168 +251,284 @@ function safeRedirect(u) {
   return [{ type: 'text', text: a }, { type: 'text', text: b }, { type: 'text', text: c }];
 }
 
-/* ========= BILLING HELPERS ========= */
-function upgradeUrl(u, plan = 'pro') {
-  const p = encodeURIComponent(plan);
-  const id = encodeURIComponent(u.id);
-  return `${APP_BASE_URL}/billing/checkout?plan=${p}&userId=${id}`;
-}
-async function createCheckoutSession({ userId, plan }) {
-  if (!stripe) throw new Error('Stripe not configured');
-  const planKey = (plan || 'pro').toLowerCase();
-  const priceId = PLAN_PRICE[planKey];
+/* ========= Quick helper ========= */
+const quick = (arr) => ({ items: arr.map(t => ({ type: 'action', action: { type: 'message', label: t, text: t } })) });
 
-  const base = {
-    mode: priceId ? 'subscription' : 'payment',
-    success_url: `${successUrl}?session_id={CHECKOUT_SESSION_ID}`,
-    cancel_url: cancelUrl,
-    metadata: { userId, plan: planKey }
-  };
-  if (priceId) {
-    base.line_items = [{ price: priceId, quantity: 1 }];
-  } else {
-    // デモ: 単発¥500
-    base.line_items = [{
-      price_data: { currency: 'jpy', product_data: { name: `China Bot ${PLANS[planKey]?.label || 'Pro'}` }, unit_amount: 500 * 100 },
-      quantity: 1
-    }];
+/* ========= Image replies ========= */
+function imageReplies(u) {
+  const first = `わぁ、${callName(u)}の写真うれしい！`;
+  return [
+    { type: 'text', text: soften(first, u), quickReply: quick(['ごはん', '風景', '自撮り', 'その他']) },
+    { type: 'text', text: 'どれかな？まちがってても大丈夫だよ〜' }
+  ];
+}
+
+/* ========= Intent ========= */
+function intent(text) {
+  const t = (text || '').trim();
+  if (/^(同意|やめておく)$/i.test(t)) return 'consent';
+  if (/^reset$/i.test(t)) return 'self_reset';
+  if (/おはよ|おはよう/i.test(t)) return 'morning';
+  if (/おやすみ|寝る|ねむ/i.test(t)) return 'night';
+  if (/寂しい|さみしい|つらい|しんど|不安/i.test(t)) return 'comfort';
+  if (/あだ名|ニックネーム|呼んで/i.test(t)) return 'nickname';
+  if (/^女性$|^女$|^男性$|^男$|性別/i.test(t)) return 'gender';
+  if (/スタンプ|stamp/i.test(t)) return 'sticker';
+  return 'chit_chat';
+}
+
+/* ========= OpenAI wrapper with 429 blackout ========= */
+const BLACKOUT_KEY = 'ai:blackout';
+async function aiBlackout() {
+  const until = await rget(BLACKOUT_KEY, 0);
+  return until && Number(until) > Date.now();
+}
+async function setBlackout(ms) {
+  const until = Date.now() + ms;
+  await rset(BLACKOUT_KEY, until, Math.ceil(ms / 1000) + 5);
+}
+
+async function llmReply(u, text) {
+  if (!openai) return null;
+  if (await aiBlackout()) return null;
+
+  const username = callName(u);
+  const userContext = `呼称: ${username} / プラン: ${humanPlan(u.plan)} / トーン: ${
+    u.loverMode ? '恋人寄り' : 'フレンドリー'
+  }`;
+  const messages = [
+    { role: 'system', content: SYSTEM_PROMPT },
+    { role: 'user', content: `コンテキスト: ${userContext}\n\n${text}` }
+  ];
+
+  try {
+    const res = await openai.chat.completions.create({
+      model: OPENAI_MODEL,
+      messages,
+      temperature: 0.6,
+      max_tokens: 200
+    });
+    return res.choices?.[0]?.message?.content?.trim() || null;
+  } catch (e) {
+    const msg = e?.error?.message || e?.message || String(e);
+    const code = e?.error?.code || e?.status || '';
+    console.warn('[openai]', code, msg);
+
+    if (String(msg).includes('Rate limit') || code === 429) {
+      // 20秒 → 80秒 → 80分（ログに出る）
+      const steps = [20000, 80000, 4800000];
+      const tries = (await rget('ai:blackout:tries', 0)) + 1;
+      const idx = Math.min(tries - 1, steps.length - 1);
+      await rset('ai:blackout:tries', tries, 60 * 60 * 6);
+      await setBlackout(steps[idx]);
+      console.log(`[openai] 429 backoff ${tries}/${steps.length}, wait ${steps[idx]}ms`);
+    }
+    return null;
   }
-  return await stripe.checkout.sessions.create(base);
 }
 
-/* ========= RESPONSES ========= */
-function planBadge(u) {
-  if (u.plan === 'vip') return '【VIP】';
-  if (u.plan === 'adult') return '【ADULT】';
-  if (u.plan === 'pro') return '【Pro】';
-  return '';
+/* ========= Billing (Stripe Checkout) ========= */
+const PLAN_PRICE = {
+  pro: STRIPE_PRICE_ID || '',
+  adult: STRIPE_PRICE_ID_ADULT || '',
+  vip: STRIPE_PRICE_ID_VIP || ''
+};
+function priceFor(plan) { return PLAN_PRICE[plan] || ''; }
+
+function successUrl() {
+  const base = APP_BASE_URL || '';
+  return base ? `${base}/billing/success` : 'https://example.com/success';
 }
-function quotaHint(u) {
-  const left = Math.max(0, (u.cap || 0) - (u.dailyCount || 0));
-  const b = planBadge(u);
-  return `${b} きょう話せる残り：${left}（上限 ${u.cap}）`;
+function cancelUrl() {
+  const base = APP_BASE_URL || '';
+  return base ? `${base}/billing/cancel` : 'https://example.com/cancel';
 }
 
-/* ========= MAIN ROUTER ========= */
+// リンク文字列（LINEで案内用）
+function checkoutLink(plan, userId) {
+  const base = APP_BASE_URL || '';
+  if (!base) return '';
+  const q = new URLSearchParams({ plan, userId }).toString();
+  return `${base}/billing/checkout?${q}`;
+}
+
+async function setPlan(userId, plan) {
+  const u = await loadUser(userId);
+  if (!u) return false;
+  u.plan = plan;
+  await saveUser(u);
+  return true;
+}
+
+/* ========= Main Routing ========= */
 async function routeText(u, raw) {
   const text = (raw || '').trim();
+  if (isSpicy(text)) return safeRedirect(u);
 
-  // 日次カウンタのリセット
-  const today = new Intl.DateTimeFormat('ja-JP', { timeZone: TIMEZONE }).format(new Date());
-  if (u.dailyDate !== today) { u.dailyDate = today; u.dailyCount = 0; await saveUser(u); }
-
-  // 同意まわり
+  // ----- CONSENT / PRE-CONSENT -----
   if (!u.consent && /^同意$/i.test(text)) {
-    u.consent = true; await saveUser(u);
+    u.consent = true;
+
+    // オーナーはスキップ
     if (OWNER_USER_ID && u.id === OWNER_USER_ID) {
-      return [{ type: 'text', text: '同意ありがとう、しょうた☺️ もっと仲良くなろう。' }];
+      await saveUser(u);
+      return [
+        { type: 'text', text: '同意ありがとう、しょうた☺️ もっと仲良くなろう。' },
+        { type: 'text', text: 'まずは今日の予定、ひとつだけ教えて？' }
+      ];
     }
-    return [{ type: 'text', text: '同意ありがとう！これからよろしくね☺️' }];
+    // 一般ユーザー: オンボーディング開始（名前）
+    u.onboarding.step = 1;
+    await saveUser(u);
+    const hint = u.profileName ? `（例：${u.profileName}）` : '（例：たろう）';
+    return [
+      { type: 'text', text: '同意ありがとう！もっと仲良くなれるね☺️' },
+      { type: 'text', text: `まずは呼んでほしいお名前を教えて？ ${hint}` }
+    ];
   }
   if (!u.consent && /^やめておく$/i.test(text)) {
     return [{ type: 'text', text: 'OK。また気が向いたら声かけてね🌸' }];
   }
+
   if (!u.consent) {
     if (shouldShowConsent(u, text)) {
-      u.consentCardShown = true; u.consentShownAt = now(); await saveUser(u);
+      u.consentCardShown = true;
+      u.consentShownAt = now();
+      await saveUser(u);
       return [consentFlex()];
     }
-    return [{ type: 'text', text: '「同意」と送ってくれたらもっと仲良くなれるよ☺️' }];
+    // 1通目が挨拶でも必ず案内
+    return [consentFlex()];
   }
 
-  // しきい値チェック（429等で詰まっても案内は出せる）
-  const left = Math.max(0, (u.cap || 0) - (u.dailyCount || 0));
-  if (left <= 0) {
-    const proUrl = upgradeUrl(u, 'pro');
-    const adultUrl = upgradeUrl(u, 'adult');
-    const vipUrl = upgradeUrl(u, 'vip');
+  // ----- ONBOARDING -----
+  if (!(OWNER_USER_ID && u.id === OWNER_USER_ID)) {
+    if (u.onboarding.step === 1) {
+      const nm = text;
+      if (nm && nm.length <= 20 && !/^同意$/i.test(nm)) {
+        u.name = nm;
+        if (isShota(u.name)) u.loverMode = true;
+        u.onboarding.step = 2;
+        await saveUser(u);
+        const base = u.name.replace(/さん|くん|ちゃん/g, '').slice(0, 4) || 'きみ';
+        return [
+          { type: 'text', text: `じゃあ ${u.name} って呼ぶね！` },
+          { type: 'text', text: `好きな呼ばれ方ある？（例：${base}ちゃん／${base}くん／${base}ぴ）\nスキップもOKだよ` }
+        ];
+      } else {
+        return [{ type: 'text', text: 'ごめん、もう一度お名前を短めに教えてくれる？（20文字以内）' }];
+      }
+    }
+    if (u.onboarding.step === 2) {
+      if (/^(スキップ|skip)$/i.test(text)) {
+        u.onboarding.step = 3; await saveUser(u);
+        return [{ type: 'text', text: '了解！このまま進めるね。これからよろしく☺️' }];
+      }
+      if (text && text.length <= 16) {
+        u.nickname = text; u.onboarding.step = 3; await saveUser(u);
+        return [{ type: 'text', text: `…${u.nickname} って呼ぶね。よろしく！` }];
+      }
+      return [{ type: 'text', text: 'ニックネームは16文字以内でお願い！スキップもOKだよ' }];
+    }
+  }
+
+  // ----- DAILY QUOTA -----
+  const { used, limit, plan } = await getUsageToday(u);
+  if (limit && used >= limit) {
+    // 上限到達：課金導線
+    const pro = checkoutLink('pro', u.id);
+    const adult = checkoutLink('adult', u.id);
+    const vip = checkoutLink('vip', u.id);
     return [
       { type: 'text', text: '今日は上限に到達しちゃった…💦' },
-      { type: 'text', text: '明日0時に回復するよ⏳ すぐ話したいならアップグレードしてね！' },
-      { type: 'text', text: `Pro：たっぷり📣\n${proUrl}` },
-      { type: 'text', text: `ADULT：恋人寄り💘\n${adultUrl}` },
-      { type: 'text', text: `VIP：ほぼ無制限✨\n${vipUrl}` }
+      { type: 'text', text: '明日0時に回復するよ⌛ すぐ話したいならアップグレードしてね！' },
+      { type: 'text', text: `Pro：たっぷり📣\n${pro}` },
+      { type: 'text', text: `ADULT：恋人寄り💘\n${adult}` },
+      { type: 'text', text: `VIP：ほぼ無制限✨\n${vip}` }
     ];
   }
 
-  if (isSpicy(text)) return safeRedirect(u);
+  // ----- INTENTS -----
+  const kind = intent(text);
 
-  // まずは軽い“手作りリード”
-  if (/(おはよ|おはよう)/i.test(text)) {
-    const a = await pickNonRepeat(u, SCRIPTS.morning, 'morning');
-    return [{ type: 'text', text: soften(a, u) }, { type: 'text', text: quotaHint(u) }];
-  }
-  if (/(おやすみ|寝る|ねむ)/i.test(text)) {
-    const a = await pickNonRepeat(u, SCRIPTS.night, 'night');
-    return [{ type: 'text', text: soften(a, u) }, { type: 'text', text: quotaHint(u) }];
+  if (kind === 'self_reset') {
+    await deleteUser(u.id);
+    return [{ type: 'text', text: '会話の記憶を初期化したよ！また最初から仲良くしてね☺️' }];
   }
 
-  // OpenAI を試す → ダメなら台本フォールバック
-  const prompt = `相手: ${callName(u)} / プラン:${u.plan} / 恋人感を少し照れながら。相手の発話:「${text}」に対し、自然な一言(60〜90字)。`;
-  const llm = await llmReply(prompt);
-  if (llm) return [{ type: 'text', text: soften(llm, u) }, { type: 'text', text: quotaHint(u) }];
+  if (kind === 'nickname') {
+    const base = (callName(u) || 'きみ').replace(/さん|くん|ちゃん/g, '').slice(0, 4) || 'きみ';
+    const cands = isShota(u.name)
+      ? ['しょーたん', 'しょたぴ', 'しょうちゃん']
+      : [`${base}ちゃん`, `${base}くん`, `${base}たん`, `${base}ぴ`, `${base}っち`];
+    const nick = pick(cands);
+    u.nickname = nick; await saveUser(u);
+    return [{ type: 'text', text: `…${nick} が可愛いと思うな。どう？` }];
+  }
 
-  // フォールバック（429時など）
-  const fallbackLead = band() === 'morning'
-    ? `おはよ、${callName(u)}。いま何してる？`
-    : band() === 'night'
-      ? `おつかれ、${callName(u)}。今日はどんな一日だった？`
-      : `ねぇ${callName(u)}、近況教えて？`;
-  return [{ type: 'text', text: soften(fallbackLead, u) }, { type: 'text', text: quotaHint(u) }];
-}
+  if (kind === 'gender') {
+    if (/女性|女/.test(text)) u.gender = 'female';
+    else if (/男性|男/.test(text)) u.gender = 'male';
+    await saveUser(u);
+    return [{ type: 'text', text: '了解だよ〜📝 メモしておくね。' }];
+  }
 
-/* ========= IMAGE REPLY ========= */
-function imageReplies(u) {
-  const first = `わぁ、${callName(u)}の写真うれしい！`;
-  return [
-    { type: 'text', text: soften(first, u) },
-    { type: 'text', text: quotaHint(u) }
-  ];
+  const messages = [];
+  const addQuotaBanner = async () => {
+    const s = await getUsageToday(u);
+    const b = quotaBanner(u, s.used, s.limit);
+    if (b) messages.push(b);
+  };
+
+  if (kind === 'morning') {
+    messages.push({ type: 'text', text: soften(fill(pick(SCRIPTS.morning), u), u) });
+    await addQuotaBanner();
+    await incUsage(u);
+    return messages;
+  }
+  if (kind === 'night') {
+    messages.push({ type: 'text', text: soften(fill(pick(SCRIPTS.night), u), u) });
+    await addQuotaBanner();
+    await incUsage(u);
+    return messages;
+  }
+  if (kind === 'comfort') {
+    const msg = (u.gender === 'female')
+      ? 'わかる…その気持ち。まずは私が味方だよ。いちばん辛いポイントだけ教えて？'
+      : 'ここにいるよ。まずは深呼吸、それから少しずつ話そ？ずっと味方☺️';
+    messages.push({ type: 'text', text: msg });
+    await addQuotaBanner();
+    await incUsage(u);
+    return messages;
+  }
+  if (kind === 'sticker') {
+    messages.push({ type: 'sticker', packageId: '11537', stickerId: pick(['52002734','52002736','52002768']) });
+    await addQuotaBanner();
+    await incUsage(u);
+    return messages;
+  }
+
+  // ----- DEFAULT: LLM Chat -----
+  let reply = await llmReply(u, text);
+  if (!reply) {
+    // LLMが使えない時のフォールバック
+    const pool = band() === 'morning' ? SCRIPTS.morning
+      : band() === 'night' ? SCRIPTS.night : SCRIPTS.random;
+    reply = soften(fill(pick(pool), u), u);
+  }
+  messages.push({ type: 'text', text: reply });
+  await addQuotaBanner();
+  await incUsage(u);
+  return messages;
 }
 
 /* ========= EXPRESS ========= */
 const app = express();
 
-app.get('/', (_, res) => res.status(200).send('china-bot monetized / OK'));
+app.get('/', (_, res) => res.status(200).send('china-bot v2.2 / OK'));
 app.get('/health', (_, res) => res.status(200).send('OK'));
 
-/* Stripe Webhook（署名検証のため raw 必須）— ここは json() より前に置く */
-app.post('/stripe/webhook', express.raw({ type: 'application/json' }), (req, res) => {
-  if (!stripe || !STRIPE_WEBHOOK_SECRET) return res.status(500).end();
-  const sig = req.headers['stripe-signature'];
-  let event;
-  try { event = stripe.webhooks.constructEvent(req.body, sig, STRIPE_WEBHOOK_SECRET); }
-  catch (err) { console.warn('[stripe:webhook] verify failed', err.message); return res.status(400).send(`Webhook Error: ${err.message}`); }
-
-  (async () => {
-    try {
-      switch (event.type) {
-        case 'checkout.session.completed': {
-          const s = event.data.object;
-          const userId = s.metadata?.userId;
-          const plan   = (s.metadata?.plan || 'pro').toLowerCase();
-          const subId  = s.subscription || null;
-          if (userId) await setPlan(userId, plan, subId);
-          break;
-        }
-        case 'customer.subscription.deleted': {
-          const sub = event.data.object;
-          const idx = await getIndex();
-          for (const id of idx) {
-            const u = await loadUser(id);
-            if (u?.subId && u.subId === sub.id) await setPlan(id, 'free', null);
-          }
-          break;
-        }
-        default: console.log('[stripe:webhook]', event.type);
-      }
-    } catch (e) { console.error('[stripe:webhook:handler]', e); }
-  })();
-
-  res.json({ received: true });
-});
-
-// LINE webhook（※この前に express.json() を置かない）
+// webhookは先にjson()を付けない
 app.post('/webhook', lineMiddleware({ channelSecret: CHANNEL_SECRET }), async (req, res) => {
   res.status(200).end();
   const events = req.body.events || [];
@@ -418,88 +538,56 @@ app.post('/webhook', lineMiddleware({ channelSecret: CHANNEL_SECRET }), async (r
       const u = await ensureUser(e);
       if (!u) continue;
 
-      // 日次カウント増加は成功応答の直前に行う（失敗時は増やさない）
-      let out = [];
       if (e.message.type === 'text') {
-        out = await routeText(u, e.message.text || '');
+        const out = await routeText(u, e.message.text || '');
+        if (out?.length) await lineClient.replyMessage(e.replyToken, out);
       } else if (e.message.type === 'image') {
-        out = imageReplies(u);
+        const out = imageReplies(u);
+        await lineClient.replyMessage(e.replyToken, out);
       } else {
-        out = [{ type: 'text', text: '送ってくれてありがとう！' }, { type: 'text', text: quotaHint(u) }];
+        await lineClient.replyMessage(e.replyToken, { type: 'text', text: '送ってくれてありがとう！' });
       }
 
-      if (out?.length) {
-        await client.replyMessage(e.replyToken, out);
-        // 成功したらカウント加算
-        u.dailyCount = (u.dailyCount || 0) + 1;
-      }
+      // 共通のターン更新
       u.turns = (u.turns || 0) + 1;
       u.lastSeenAt = now();
       await saveUser(u);
     } catch (err) {
-      // OpenAI429などで返信できなかった場合も“混み合い中”のスパムを避ける
       console.error('reply error', err?.response?.status || '-', err?.response?.data || err);
     }
   }
 });
 
-// ここから下は JSON でOK
+// webhook以外はJSON OK
 app.use('/tasks', express.json());
 app.use('/admin', express.json());
-app.use('/billing', express.json()); // POST /billing/checkout 用
+app.use('/billing', express.json());
+app.use('/stripe', express.raw({ type: 'application/json' })); // 署名検証のため raw
 
-/* ========= BILLING ROUTES ========= */
-// GET 版（LINEからタップ→Stripeへリダイレクト）
-app.get('/billing/checkout', async (req, res) => {
-  try {
-    if (!stripe) return res.status(500).send('Stripe not configured');
-    const userId = (req.query.userId || '').toString();
-    const plan   = (req.query.plan || 'pro').toString();
-    if (!userId) return res.status(400).send('userId required');
-    const session = await createCheckoutSession({ userId, plan });
-    return res.redirect(303, session.url);
-  } catch (e) {
-    console.error('[billing:get]', e);
-    res.status(500).send('Checkout error');
-  }
-});
-// POST 版（管理画面等→URL返却）
-app.post('/billing/checkout', async (req, res) => {
-  try {
-    if (!stripe) return res.status(500).json({ ok: false, error: 'Stripe not configured' });
-    const { userId, plan = 'pro' } = req.body || {};
-    if (!userId) return res.status(400).json({ ok: false, error: 'userId required' });
-    const session = await createCheckoutSession({ userId, plan });
-    res.json({ ok: true, url: session.url });
-  } catch (e) {
-    console.error('[billing:post]', e);
-    res.status(500).json({ ok: false });
-  }
-});
-app.get('/billing/success', (_, res) => res.status(200).send('決済に成功しました。LINEに戻って会話を続けてね！'));
-app.get('/billing/cancel',  (_, res) => res.status(200).send('決済をキャンセルしました。必要になったらまた呼んでね。'));
-
-/* ========= BROADCAST ========= */
+/* ========= Broadcast (cronから呼ぶ) ========= */
 app.all('/tasks/broadcast', async (req, res) => {
   try {
     const key = req.headers['broadcast_auth_token'];
-    if (!BROADCAST_AUTH_TOKEN || key !== BROADCAST_AUTH_TOKEN) return res.status(401).json({ ok: false, error: 'unauthorized' });
+    if (!BROADCAST_AUTH_TOKEN || key !== BROADCAST_AUTH_TOKEN) {
+      return res.status(401).json({ ok: false, error: 'unauthorized' });
+    }
     const type = (req.query.type || req.body?.type || 'random').toString();
     const pool = type === 'morning' ? SCRIPTS.morning : type === 'night' ? SCRIPTS.night : SCRIPTS.random;
     const idx = await getIndex();
     if (!idx.length) return res.json({ ok: true, sent: 0 });
 
-    const text = pick(pool);
-    const msg = [{ type: 'text', text }];
-    await Promise.allSettled(idx.map(id => client.pushMessage(id, msg).catch(() => {})));
-    res.json({ ok: true, type, sent: idx.length, sample: text });
+    const sample = fill(pick(pool), { nickname: 'みんな', name: 'みんな', loverMode: false });
+    const msg = [{ type: 'text', text: sample }];
+
+    await Promise.allSettled(idx.map(id => lineClient.pushMessage(id, msg).catch(() => {})));
+    res.json({ ok: true, type, sent: idx.length, sample });
   } catch (e) {
     console.error('broadcast error', e?.response?.data || e);
     res.status(500).json({ ok: false });
   }
 });
 
-/* ========= RESET ========= */
+/* ========= Reset ========= */
 app.post('/reset/me', async (req, res) => {
   const { userId } = req.body || {};
   if (!userId) return res.status(400).json({ ok: false, error: 'userId required' });
@@ -509,11 +597,15 @@ app.post('/reset/me', async (req, res) => {
 app.post('/admin/reset', async (req, res) => {
   const key = req.header('ADMIN_TOKEN') || req.query.key;
   if (!ADMIN_TOKEN || key !== ADMIN_TOKEN) return res.status(403).json({ ok: false });
+
   const { userId } = req.body || {};
-  if (userId) { await deleteUser(userId); return res.json({ ok: true, target: userId }); }
-  const idx = await getIndex(); await Promise.allSettled(idx.map(id => deleteUser(id)));
+  if (userId) {
+    await deleteUser(userId);
+    return res.json({ ok: true, target: userId });
+  }
+  const idx = await getIndex();
+  await Promise.allSettled(idx.map(id => deleteUser(id)));
   res.json({ ok: true, cleared: idx.length });
 });
 
-/* ========= START ========= */
-app.listen(PORT, () => console.log(`Server started on ${PORT}`));
+/* =========
