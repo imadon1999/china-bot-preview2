@@ -607,4 +607,96 @@ app.post('/admin/reset', async (req, res) => {
   res.json({ ok: true, cleared: idx.length });
 });
 
-/* =========
+/* ========= Billing (Express endpoints) ========= */
+
+// 成功/キャンセルの画面（簡易）
+app.get('/billing/success', (_, res) => {
+  res.status(200).send('Thanks! 決済に成功しました。LINEに戻ってお楽しみください。');
+});
+app.get('/billing/cancel', (_, res) => {
+  res.status(200).send('キャンセルしました。いつでもまたどうぞ！');
+});
+
+// GET でも POST でも受ける（LINE からはリンクで GET を想定）
+app.all('/billing/checkout', async (req, res) => {
+  try {
+    if (!stripe) return res.status(500).json({ ok: false, error: 'stripe_not_configured' });
+
+    // plan & userId を取得
+    const plan = (req.query.plan || req.body?.plan || 'pro').toString();
+    const userId = (req.query.userId || req.body?.userId || '').toString();
+    if (!userId) return res.status(400).json({ ok: false, error: 'userId required' });
+
+    // Price ID を選択（環境変数にないプランは 400）
+    const priceId =
+      plan === 'vip'   ? STRIPE_PRICE_ID_VIP :
+      plan === 'adult' ? STRIPE_PRICE_ID_ADULT :
+      plan === 'pro'   ? STRIPE_PRICE_ID :
+      '';
+    if (!priceId) return res.status(400).json({ ok: false, error: 'price_not_configured' });
+
+    const session = await stripe.checkout.sessions.create({
+      mode: 'subscription',
+      line_items: [{ price: priceId, quantity: 1 }],
+      success_url: successUrl(),
+      cancel_url: cancelUrl(),
+      metadata: { userId, plan },
+      allow_promotion_codes: true,
+    });
+
+    // ブラウザ直アクセスならリダイレクト、API的に使うなら JSON
+    const wantsHtml = (req.headers.accept || '').includes('text/html');
+    if (wantsHtml) return res.redirect(303, session.url);
+    return res.json({ ok: true, url: session.url });
+  } catch (e) {
+    console.error('checkout error', e?.message || e);
+    res.status(500).json({ ok: false, error: 'checkout_failed' });
+  }
+});
+
+/* ========= Stripe Webhook ========= */
+// /stripe 直下は raw を適用している（上の app.use('/stripe', express.raw(...))）
+app.post('/stripe/webhook', async (req, res) => {
+  if (!stripe || !STRIPE_WEBHOOK_SECRET) {
+    return res.status(500).send('stripe_not_configured');
+  }
+  const sig = req.headers['stripe-signature'];
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    console.warn('stripe webhook verify failed', err?.message || err);
+    return res.status(400).send('invalid_signature');
+  }
+
+  try {
+    switch (event.type) {
+      case 'checkout.session.completed': {
+        const s = event.data.object;
+        const userId = s.metadata?.userId;
+        const plan = (s.metadata?.plan || 'pro').toString();
+        if (userId) await setPlan(userId, plan);
+        break;
+      }
+      case 'customer.subscription.deleted': {
+        // サブスク解約 → free に戻す
+        // 顧客ID→userId を自前で紐付けている場合はそこで解決。
+        // 今回はチェックアウト metadata に userId を入れているので、
+        // 必要があれば顧客ID→userId の保存実装を追加してください。
+        break;
+      }
+      default:
+        // 他イベントはスルー
+        break;
+    }
+    res.json({ received: true });
+  } catch (e) {
+    console.error('webhook handler error', e?.message || e);
+    res.status(500).send('webhook_error');
+  }
+});
+
+/* ========= Start ========= */
+app.listen(PORT, () => {
+  console.log(`Server started on ${PORT}`);
+});
